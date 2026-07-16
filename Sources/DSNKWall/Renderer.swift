@@ -57,17 +57,18 @@ struct GPUUniforms {
     var beatBrightnessBoost: Float
 
     // float4 in Metal. Packed VHS extras in components.
-    /// .x = logo roll offset, .y = roll velocity, .w = vhsLogoBeatWarp
+    /// .x = logo roll offset, .y = roll velocity, .z = cameraOriginV, .w = vhsLogoBeatWarp
     var lavaTrough: SIMD4<Float>
-    /// .x = logoGlowNoise, .w = vhsVideoOverCamera
+    /// .x = logoGlowNoise, .y = vhsVideoOpacity, .z = cameraOriginU, .w = vhsVideoOverCamera
     var lavaMid: SIMD4<Float>
-    /// .x = logoScanJitter, .w = vhsCameraStrength
+    /// .x = logoScanJitter, .y = cameraSquareMargin, .z = cameraTrailStrength, .w = vhsCameraStrength
+    /// camera square size fraction is packed in liquidCam.z (main/degrade passes).
     var lavaHot: SIMD4<Float>
 
     /// .x = degrade intensity, .y = beat boost, .z = glow intensity, .w = glow radius
     var vhsDegrade: SIMD4<Float>
 
-    /// .x = camera EMA alpha, .y = idle decay (EMA pass), .z unused, .w = gif opacity
+    /// .x = camera EMA alpha, .y = idle decay (EMA pass), .z = cameraSquareSize (main/degrade), .w = gif opacity
     var liquidCam: SIMD4<Float>
 
     /// VHS GIF sticker: xy origin, zw size (UV Y-down)
@@ -85,6 +86,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     let videoTexture: VideoTexture
     let cameraCapture: CameraCapture
     let gifOverlay: GifOverlay
+    let videoPresence: VideoPresence
+    let cameraPlacement: CameraPlacement
     let audioBeat: AudioBeat
     let logoRoll: LogoRollPhysics
 
@@ -105,7 +108,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         metalView.device = device
         metalView.colorPixelFormat = .bgra8Unorm
         metalView.framebufferOnly = true
+        // We size the drawable ourselves so fullscreen Retina doesn't go 5K native.
+        metalView.autoResizeDrawable = false
         metalView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        Self.syncDrawableSize(metalView)
 
         guard let queue = device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
@@ -134,6 +140,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         self.gifOverlay = gifs
+        self.videoPresence = VideoPresence()
+        self.cameraPlacement = CameraPlacement()
         self.logoRoll = LogoRollPhysics()
 
         guard let fallbackCam = Self.makeSolidTexture(device: device) else { return nil }
@@ -207,6 +215,31 @@ final class Renderer: NSObject, MTKViewDelegate {
         ensureEMATextures(width: Int(viewportSize.x), height: Int(viewportSize.y))
     }
 
+    /// Cap render resolution so expensive per-pixel passes stay interactive fullscreen.
+    static func syncDrawableSize(_ view: MTKView) {
+        let scale: CGFloat
+        if let window = view.window {
+            scale = window.backingScaleFactor
+        } else if let layer = view.layer {
+            scale = layer.contentsScale
+        } else {
+            scale = 2
+        }
+        var w = max(view.bounds.width, 1) * scale
+        var h = max(view.bounds.height, 1) * scale
+        let longEdge = max(w, h)
+        let maxEdge = Config.maxRenderLongEdge
+        if longEdge > maxEdge {
+            let s = maxEdge / longEdge
+            w *= s
+            h *= s
+        }
+        let newSize = CGSize(width: max(1, floor(w)), height: max(1, floor(h)))
+        if view.drawableSize != newSize {
+            view.drawableSize = newSize
+        }
+    }
+
     private func ensureSceneTexture(width: Int, height: Int) {
         let w = max(width, 1)
         let h = max(height, 1)
@@ -273,7 +306,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         audioBeat.tick()
         videoTexture.update()
 
-        // Always sync from the view — avoids a missing initial drawableSizeWillChange.
+        // Keep drawable capped (bounds change on green-button fullscreen).
+        Self.syncDrawableSize(view)
+
         let ds = view.drawableSize
         if ds.width > 1, ds.height > 1 {
             viewportSize = SIMD2<Float>(Float(ds.width), Float(ds.height))
@@ -286,6 +321,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         let w = viewportSize.x
         let h = viewportSize.y
         gifOverlay.update(time: now, viewport: viewportSize, beatPulse: audioBeat.beatPulse)
+        videoPresence.update(time: now, beatPulse: audioBeat.beatPulse)
+        cameraPlacement.update(time: now, viewport: viewportSize)
         let roll = logoRoll.update(now: now, beatPulse: audioBeat.beatPulse)
         // Logo rect in framebuffer pixels, origin = top-left (Metal Y-down).
         let side = Config.logoMaxFraction * min(w, h)
@@ -332,9 +369,24 @@ final class Renderer: NSObject, MTKViewDelegate {
             logoGlowRadius: Config.logoGlowRadius,
             beatDistortionBoost: Config.beatDistortionBoost,
             beatBrightnessBoost: Config.beatBrightnessBoost,
-            lavaTrough: SIMD4<Float>(roll.offset, roll.velocity, 0, Config.vhsLogoBeatWarp),
-            lavaMid: SIMD4<Float>(Config.logoGlowNoise, 0, 0, Config.vhsVideoOverCamera),
-            lavaHot: SIMD4<Float>(Config.logoScanJitter, 0, 0, Config.vhsCameraStrength),
+            lavaTrough: SIMD4<Float>(
+                roll.offset,
+                roll.velocity,
+                cameraPlacement.originUV.y,
+                Config.vhsLogoBeatWarp
+            ),
+            lavaMid: SIMD4<Float>(
+                Config.logoGlowNoise,
+                videoPresence.opacity,
+                cameraPlacement.originUV.x,
+                Config.vhsVideoOverCamera
+            ),
+            lavaHot: SIMD4<Float>(
+                Config.logoScanJitter,
+                Config.cameraSquareMargin,
+                Config.cameraTrailStrength,
+                Config.vhsCameraStrength * cameraPlacement.opacity
+            ),
             vhsDegrade: SIMD4<Float>(
                 Config.vhsDegradeIntensity,
                 Config.vhsDegradeBeatBoost,
@@ -344,7 +396,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             liquidCam: SIMD4<Float>(
                 Config.cameraEMAAlpha,
                 0,
-                0,
+                cameraPlacement.sizeFrac,
                 gifOverlay.currentOpacity
             ),
             gifOverlay: gifOverlay.rect
@@ -354,16 +406,17 @@ final class Renderer: NSObject, MTKViewDelegate {
         let camEMARead: MTLTexture
         if let prev = emaTextures[emaIndex],
            let next = emaTextures[1 - emaIndex] {
-            // Stride: pull a new camera sample every N frames; otherwise decay history.
-            let stride = (emaFrameCounter % Config.cameraEMAStride) == 0
+            // Stride: stamp only while camera is present; otherwise just fade the trail.
+            let camOn = cameraPlacement.opacity > 0.02
+            let stride = camOn && (emaFrameCounter % Config.cameraEMAStride) == 0
             emaFrameCounter &+= 1
 
             var emaUniforms = uniforms
-            // EMA pass packs: .x alpha, .y idle decay, .w stride flag
+            // Trail pass packs: .x stamp alpha, .y idle decay, .w stride flag
             emaUniforms.liquidCam = SIMD4<Float>(
                 Config.cameraEMAAlpha,
                 Config.cameraEMAIdleDecay,
-                0,
+                cameraPlacement.sizeFrac,
                 stride ? 1 : 0
             )
 
@@ -389,7 +442,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         guard let scene = sceneTexture else { return }
 
-        // Pass 1: camera underlay + video + GIFs (no logo) → offscreen
+        // Pass 1: warped VHS video + GIFs (no camera, no logo) → offscreen
         var sceneUniforms = uniforms
         sceneUniforms.logoSize = .zero
         sceneUniforms.logoOrigin = .zero
@@ -408,12 +461,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc1.setFragmentSamplerState(samplerState, index: 1)
         enc1.setFragmentTexture(gifOverlay.texture, index: 2)
         enc1.setFragmentSamplerState(samplerState, index: 2)
-        enc1.setFragmentTexture(camEMARead, index: 3)
+        enc1.setFragmentTexture(camEMARead, index: 3) // unused in pass 1; camera composites after warp
         enc1.setFragmentSamplerState(samplerState, index: 3)
         enc1.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc1.endEncoding()
 
-        // Pass 2: VHS degrade (on top of GIFs) + sharp DSNK logo on top → drawable
+        // Pass 2: VHS degrade → unwarped camera under → DSNK logo on top → drawable
         guard let enc2 = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
         enc2.setRenderPipelineState(degradePipelineState)
         enc2.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
@@ -421,6 +474,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc2.setFragmentSamplerState(samplerState, index: 0)
         enc2.setFragmentTexture(logoTexture, index: 1)
         enc2.setFragmentSamplerState(samplerState, index: 1)
+        enc2.setFragmentTexture(camLive, index: 2)
+        enc2.setFragmentSamplerState(samplerState, index: 2)
+        enc2.setFragmentTexture(camEMARead, index: 3)
+        enc2.setFragmentSamplerState(samplerState, index: 3)
         enc2.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc2.endEncoding()
 

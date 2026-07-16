@@ -143,6 +143,10 @@ enum FrameDump {
             enc2.setFragmentSamplerState(sampler, index: 0)
             enc2.setFragmentTexture(logo, index: 1)
             enc2.setFragmentSamplerState(sampler, index: 1)
+            enc2.setFragmentTexture(camEMA, index: 2) // live stand-in for dump
+            enc2.setFragmentSamplerState(sampler, index: 2)
+            enc2.setFragmentTexture(camEMA, index: 3) // trail
+            enc2.setFragmentSamplerState(sampler, index: 3)
             enc2.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc2.endEncoding()
 
@@ -203,9 +207,14 @@ enum FrameDump {
             logoGlowRadius: Config.logoGlowRadius,
             beatDistortionBoost: Config.beatDistortionBoost,
             beatBrightnessBoost: Config.beatBrightnessBoost,
-            lavaTrough: SIMD4<Float>(0, 0, 0, Config.vhsLogoBeatWarp),
-            lavaMid: SIMD4<Float>(Config.logoGlowNoise, 0, 0, Config.vhsVideoOverCamera),
-            lavaHot: SIMD4<Float>(Config.logoScanJitter, 0, 0, Config.vhsCameraStrength),
+            lavaTrough: SIMD4<Float>(0, 0, 0.25, Config.vhsLogoBeatWarp),
+            lavaMid: SIMD4<Float>(Config.logoGlowNoise, 1, 0.25, Config.vhsVideoOverCamera),
+            lavaHot: SIMD4<Float>(
+                Config.logoScanJitter,
+                Config.cameraSquareMargin,
+                Config.cameraTrailStrength,
+                Config.vhsCameraStrength
+            ),
             vhsDegrade: SIMD4<Float>(
                 Config.vhsDegradeIntensity,
                 Config.vhsDegradeBeatBoost,
@@ -215,7 +224,7 @@ enum FrameDump {
             liquidCam: SIMD4<Float>(
                 Config.cameraEMAAlpha,
                 0,
-                0,
+                Config.cameraSquareSize,
                 0
             ),
             gifOverlay: SIMD4<Float>.zero

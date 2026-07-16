@@ -1,3 +1,4 @@
+import CoreGraphics
 import simd
 
 /// All visual / audio tuning constants. Tweak and rebuild.
@@ -35,13 +36,13 @@ enum Config {
     // MARK: - VHS warp
 
     /// Overall horizontal wrap-warp amount.
-    static let vhsWarpAmount: Float = 0.10
+    static let vhsWarpAmount: Float = 0.14
     /// Speed of the drifting tracking band.
-    static let vhsTrackingBandSpeed: Float = 0.22
+    static let vhsTrackingBandSpeed: Float = 0.28
     /// Per-scanline random jitter amount.
-    static let vhsJitterAmount: Float = 0.012
+    static let vhsJitterAmount: Float = 0.016
     /// Head-switch tear strength at bottom of frame.
-    static let headSwitchNoise: Float = 0.55
+    static let headSwitchNoise: Float = 0.7
 
     // MARK: - VHS degradation layer (Shadertoy 7clXDX Image + Buffer D)
 
@@ -67,18 +68,32 @@ enum Config {
     /// Speed of blob undulation.
     static let blobSpeed: Float = 0.3
 
-    // MARK: - Camera EMA (black→red underlay)
+    // MARK: - Camera (live + strided decay trail underlay)
 
-    /// EMA blend toward each new camera sample (higher = faster decay of trails).
-    static let cameraEMAAlpha: Float = 0.38
-    /// Only pull a new camera sample into the EMA every N frames.
+    /// How hard a strided sample stamps into the decay trail (lower = gentler ghosts).
+    static let cameraEMAAlpha: Float = 0.14
+    /// Only stamp a new camera sample into the trail every N frames.
     static let cameraEMAStride: Int = 10
-    /// Per-frame multiply on EMA history when not striding (lower = faster decay).
-    static let cameraEMAIdleDecay: Float = 0.84
-    /// VHS: black→red camera underlay strength (0…1).
-    static let vhsCameraStrength: Float = 0.9
-    /// How much VHS video covers the camera underlay (0 = only cam, 1 = only video).
-    static let vhsVideoOverCamera: Float = 0.72
+    /// Per-frame multiply on trail history when not striding (lower = faster fade / less decay linger).
+    static let cameraEMAIdleDecay: Float = 0.78
+    /// Live camera underlay strength (0…1+). Composited after warp.
+    static let vhsCameraStrength: Float = 0.55
+    /// How much warped VHS video covers the (unwarped) camera (0 = only cam, 1 = only video).
+    static let vhsVideoOverCamera: Float = 0.78
+    /// Gentle overlay of the strided decay trail relative to the live frame (0…1).
+    static let cameraTrailStrength: Float = 0.18
+    /// Minimum margin on every side for the square camera crop (0…0.49).
+    static let cameraSquareMargin: Float = 0.20
+    /// Camera square side as a fraction of min(width, height); < (1−2×margin) so it can move.
+    static let cameraSquareSize: Float = 0.50
+    /// How long the camera stays visible when it appears (seconds).
+    static let cameraPresenceMinDuration: Float = 3.5
+    static let cameraPresenceMaxDuration: Float = 6.5
+    /// Long gaps between appearances — with the durations above, on-time ≈ 1/4 of the cycle.
+    static let cameraPresenceMinGap: Float = 12.0
+    static let cameraPresenceMaxGap: Float = 22.0
+    /// Fade in/out duration (seconds).
+    static let cameraPresenceFade: Float = 0.4
 
     // MARK: - VHS Y2K GIF overlays (from giphy.com/explore/y2k)
 
@@ -98,6 +113,20 @@ enum Config {
     static let gifOverlayMaxScale: Float = 0.42
     /// Onset threshold for counting a beat against GIF lifetime.
     static let gifOverlayBeatThreshold: Float = 0.32
+
+    // MARK: - VHS video presence (GIF-like schedule, ~2× on-time, independent phase/RNG)
+
+    /// Seconds between video appearances (own random draws; slightly wider than GIFs).
+    static let videoPresenceMinGap: Float = 3.0
+    static let videoPresenceMaxGap: Float = 9.0
+    /// End after this many kick onsets, or max duration — whichever first (2× GIF).
+    static let videoPresenceBeatCount: Int = 32
+    /// Hard cap on how long the MP4 stays visible (seconds; 2× GIF).
+    static let videoPresenceMaxDuration: Float = 20.0
+    /// Fade in/out duration (seconds).
+    static let videoPresenceFade: Float = 0.35
+    /// Onset threshold for counting a beat against video lifetime.
+    static let videoPresenceBeatThreshold: Float = 0.32
 
     // MARK: - Global
 
@@ -145,16 +174,22 @@ enum Config {
     /// Vertical motion-blur amount scaled by |roll velocity|.
     static let logoRollMotionBlur: Float = 0.045
 
+    // MARK: - Performance
+
+    /// Cap the Metal drawable long-edge (pixels). Fullscreen Retina otherwise
+    /// runs chroma×bloom×degrade at 5K+ and tanks the frame rate.
+    static let maxRenderLongEdge: CGFloat = 1920
+
     // MARK: - Beat
 
     /// How easily onsets trigger (higher = more sensitive).
-    static let beatSensitivity: Float = 1.4
+    static let beatSensitivity: Float = 1.75
     /// Per-frame exponential decay of beat pulse (closer to 1 = longer).
-    static let beatDecay: Float = 0.88
+    static let beatDecay: Float = 0.90
     /// Kick spike multiplier for VHS shear / tracking / head-switch warp.
-    static let beatWarpBoost: Float = 5.0
+    static let beatWarpBoost: Float = 6.5
     /// Packed into the `beatDistortionBoost` uniform (VHS warp uses this).
     static let beatDistortionBoost: Float = beatWarpBoost
     /// Brightness spike on beat.
-    static let beatBrightnessBoost: Float = 0.45
+    static let beatBrightnessBoost: Float = 0.65
 }

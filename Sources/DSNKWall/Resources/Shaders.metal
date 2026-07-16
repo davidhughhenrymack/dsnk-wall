@@ -58,17 +58,17 @@ struct Uniforms {
     float beatDistortionBoost;
     float beatBrightnessBoost;
 
-    // .x = logo roll offset (0…1), .y = roll velocity, .w = vhsLogoBeatWarp
+    // .x = logo roll offset (0…1), .y = roll velocity, .z = cameraOriginV, .w = vhsLogoBeatWarp
     float4 lavaTrough;
-    // .x = logoGlowNoise, .w = vhsVideoOverCamera
+    // .x = logoGlowNoise, .y = vhsVideoOpacity, .z = cameraOriginU, .w = vhsVideoOverCamera
     float4 lavaMid;
-    // .x = logoScanJitter, .w = vhsCameraStrength
+    // .x = logoScanJitter, .y = cameraSquareMargin, .z = cameraTrailStrength, .w = vhsCameraStrength
     float4 lavaHot;
 
     // .x = degrade intensity, .y = beat boost, .z = glow intensity, .w = glow radius (UV)
     float4 vhsDegrade;
 
-    // .x = camera EMA alpha, .y = idle decay (EMA pass), .z unused, .w = gif opacity
+    // .x = camera EMA alpha, .y = idle decay (EMA pass), .z = cameraSquareSize, .w = gif opacity / stride
     float4 liquidCam;
 
     // VHS Y2K GIF sticker: xy = top-left UV (Y-down), zw = size UV
@@ -367,38 +367,40 @@ float3 vhsNoiseRdr(float2 uv, float2 ouv, float3 orig, float time, thread float 
 
 /// Kick energy 0…1 from onset pulse + sustained bass level.
 float kickAmount(constant Uniforms &u) {
-    return saturate(u.beatPulse + u.beatLevel * 0.45);
+    return saturate(u.beatPulse + u.beatLevel * 0.55);
 }
 
 /// Horizontal VHS shear / tracking / head-switch tear. `ouv` is Y-up.
 float2 applyVHSShear(float2 ouv, float2 uv, float2 res, constant Uniforms &u) {
     float t = u.time;
     float kick = kickAmount(u);
-    float warpMul = 1.0 + kick * u.beatDistortionBoost;
+    // Stronger kick drive so the background video snaps with the beat
+    float warpMul = 1.0 + kick * u.beatDistortionBoost * 1.35;
     float shear = u.vhsWarpAmount * warpMul;
-    float jitter = u.vhsJitterAmount * (1.0 + kick * 6.0);
+    float jitter = u.vhsJitterAmount * (1.0 + kick * 9.0);
 
     float stppx = 0.0015;
     float2 qouv = floor(ouv / stppx) * stppx;
     float2 quv = floor(uv / stppx) * stppx;
 
     // Primary scanline shear (kicks punch this hard)
-    qouv.x += sin(fmod(quv.y + t, 0.2) / 0.2) * 0.003 * (1.0 + shear * 10.0);
+    qouv.x += sin(fmod(quv.y + t, 0.2) / 0.2) * 0.003 * (1.0 + shear * 12.0);
     qouv.x += sin(fmod(quv.x * 10.0 + t, 1.0) * 10.0) * 0.0005 * warpMul;
+    qouv.x += sin(quv.y * 40.0 + t * 8.0) * 0.004 * kick * warpMul;
 
-    // Drifting tracking band
-    float bandY = ouv.y * 28.0 + t * u.vhsTrackingBandSpeed * 12.0;
-    qouv.x += sin(bandY) * 0.01 * shear * (0.35 + kick * 1.4);
-    qouv.x += sin(bandY * 2.7 + 1.7) * 0.004 * shear * kick;
+    // Drifting tracking band — jumps harder on kick
+    float bandY = ouv.y * 28.0 + t * u.vhsTrackingBandSpeed * (12.0 + kick * 18.0);
+    qouv.x += sin(bandY) * 0.01 * shear * (0.35 + kick * 2.2);
+    qouv.x += sin(bandY * 2.7 + 1.7) * 0.006 * shear * kick;
 
     // Per-scanline jitter
     float scan = floor(ouv.y * res.y);
-    qouv.x += (hash21(float2(scan, floor(t * 48.0))) - 0.5) * jitter;
+    qouv.x += (hash21(float2(scan, floor(t * (48.0 + kick * 40.0)))) - 0.5) * jitter;
 
     // Head-switch tear at bottom of frame (low ouv.y)
-    float head = smoothstep(0.14, 0.0, ouv.y) * u.headSwitchNoise * (0.25 + kick * 1.8);
-    qouv.x += (hash21(float2(floor(ouv.y * 90.0), floor(t * 22.0))) - 0.5) * head * 0.1;
-    qouv.x += sin(ouv.y * 120.0 + t * 30.0) * head * 0.02;
+    float head = smoothstep(0.14, 0.0, ouv.y) * u.headSwitchNoise * (0.25 + kick * 2.4);
+    qouv.x += (hash21(float2(floor(ouv.y * 90.0), floor(t * 22.0))) - 0.5) * head * 0.12;
+    qouv.x += sin(ouv.y * 120.0 + t * 30.0) * head * 0.028;
 
     return fract(qouv);
 }
@@ -414,20 +416,18 @@ float3 sampleNoisedScene(float2 ouv, float2 uv, float2 res,
     return vhsNoiseRdr(quv, qouv, orig, u.time, seed);
 }
 
-/// Approximate doBloom by re-sampling the noised video (cheaper sample count).
+/// Approximate doBloom by re-sampling the noised video (kept light — chroma already samples neighbors).
 float3 doBloom(float2 uv, float2 res, float blur, float threshold,
                constant Uniforms &u,
                texture2d<float> videoTex, sampler videoSamp) {
     float3 col = float3(0.0);
-    const int cnt = 24;
+    const int cnt = 10;
     float fcnt = float(cnt);
     for (int i = 0; i < cnt; ++i) {
         float fi = float(i);
-        float samplePerTurn = 5.0;
-        float an = (fi / (fcnt / samplePerTurn)) * kPI;
+        float an = (fi / fcnt) * kPI * 2.0;
         float2 p = uv - float2(sin(an), cos(an)) * blur;
         p = clamp(p, float2(0.001), float2(0.999));
-        // centered uv for noise pass
         float2 frag = p * res;
         float2 nuv = (frag - 0.5 * res) / max(res.x, 1.0);
         float3 smple = sampleNoisedScene(p, nuv, res, u, videoTex, videoSamp);
@@ -464,28 +464,138 @@ float3 yuv2rgb(float3 yuv) {
     );
 }
 
-/// Black→red remap of camera luminance (VHS underlay).
-float3 cameraBlackRed(float2 uvScreen, float2 res,
-                      texture2d<float> camEMA, sampler camSamp) {
-    float2 camSize = float2(camEMA.get_width(), camEMA.get_height());
-    if (camSize.x < 2.0 || camSize.y < 2.0) return float3(0.0);
-    float2 camUV = aspectFillUV(uvScreen, camSize, res);
-    float3 cam = camEMA.sample(camSamp, camUV).rgb;
-    float lum = saturate(dot(cam, float3(0.299, 0.587, 0.114)));
-    lum = pow(lum, 0.9);
-    return float3(lum, lum * 0.04, lum * 0.02); // black → deep red
+float cameraSquareMargin(constant Uniforms &u) {
+    return u.lavaHot.y > 0.001 ? u.lavaHot.y : 0.20;
 }
 
-/// VHS background: black→red camera underlay + video + noise + bloom. No logo.
+float cameraSquareSizeFrac(constant Uniforms &u) {
+    return u.liquidCam.z > 0.001 ? u.liquidCam.z : 0.50;
+}
+
+float2 cameraSquareOriginUV(constant Uniforms &u) {
+    return float2(u.lavaMid.z, u.lavaTrough.z);
+}
+
+/// Random-placed square. local UV in [0,1] when inside.
+bool cameraSquareLocal(float2 uvScreen, float2 res, constant Uniforms &u, thread float2 &local) {
+    float side = min(res.x, res.y) * cameraSquareSizeFrac(u);
+    float2 origin = cameraSquareOriginUV(u) * res;
+    local = (uvScreen * res - origin) / max(side, 1.0);
+    return all(local >= float2(0.0)) && all(local <= float2(1.0));
+}
+
+float3 cameraLumaToRed(float3 cam) {
+    float lum = saturate(dot(cam, float3(0.299, 0.587, 0.114)));
+    lum = pow(lum, 0.72);
+    lum = smoothstep(0.02, 0.94, lum);
+    return float3(lum, lum * 0.10, lum * 0.035); // black → red
+}
+
+/// Mild VHS warp inside the camera square (light shear / tracking / chroma).
+float2 warpCameraLocal(float2 local, float2 res, constant Uniforms &u) {
+    float t = u.time;
+    float kick = kickAmount(u);
+    float2 w = local;
+    float scan = floor(local.y * 140.0);
+    // Reduced scanline distortion vs the main VHS plate
+    w.x += (hash21(float2(scan, floor(t * 42.0))) - 0.5) * 0.014 * (1.0 + kick * 0.8);
+    w.x += sin(local.y * 60.0 + t * 14.0) * 0.006 * (1.0 + u.vhsWarpAmount * 4.0);
+    w.x += sin(local.y * 18.0 + t * u.vhsTrackingBandSpeed * 10.0) * 0.01 * (0.35 + kick * 0.6);
+    w.y += sin(local.x * 28.0 + t * 4.0) * 0.004;
+    float head = smoothstep(0.18, 0.0, local.y) * u.headSwitchNoise * (0.2 + kick * 1.0);
+    w.x += (hash21(float2(floor(local.y * 80.0), floor(t * 20.0))) - 0.5) * head * 0.05;
+    return clamp(w, float2(0.001), float2(0.999));
+}
+
+float3 sampleCameraVHSRGB(float2 local, float2 res, constant Uniforms &u,
+                          texture2d<float> camTex, sampler camSamp) {
+    float2 camSize = float2(camTex.get_width(), camTex.get_height());
+    if (camSize.x < 2.0 || camSize.y < 2.0) return float3(0.0);
+
+    float2 warped = warpCameraLocal(local, res, u);
+    float kick = kickAmount(u);
+    float ca = 0.006 + kick * 0.008 + u.vhsJitterAmount * 0.2;
+    float2 uv0 = aspectFillUV(warped, camSize, float2(1.0));
+    float2 uvR = aspectFillUV(clamp(warped + float2(ca, 0.0), 0.001, 0.999), camSize, float2(1.0));
+    float2 uvB = aspectFillUV(clamp(warped - float2(ca, 0.0), 0.001, 0.999), camSize, float2(1.0));
+    float3 rgb = float3(
+        camTex.sample(camSamp, uvR).r,
+        camTex.sample(camSamp, uv0).g,
+        camTex.sample(camSamp, uvB).b
+    );
+    return rgb;
+}
+
+/// Live camera: VHS-treated black→red square (outside = black).
+float3 cameraBlackRedLive(float2 uvScreen, float2 res, constant Uniforms &u,
+                          texture2d<float> camTex, sampler camSamp) {
+    float2 local;
+    if (!cameraSquareLocal(uvScreen, res, u, local)) return float3(0.0);
+
+    float3 rgb = sampleCameraVHSRGB(local, res, u, camTex, camSamp);
+    float3 red = cameraLumaToRed(rgb);
+
+    float t = u.time;
+    float2 ouv = float2(local.x, 1.0 - local.y);
+    float2 quv = floor((local - 0.5) / 0.0015) * 0.0015;
+    float seed = noiseCh2(quv) + fract(t);
+    // Soft noise mix — keep scanline modulation gentle
+    float3 noisy = vhsNoiseRdr(quv, ouv, red, t, seed);
+    red = mix(red, noisy, 0.45);
+    float scan = 0.94 + 0.06 * sin(local.y * res.y * 3.14159);
+    red *= scan;
+    float snow = hash21(float2(floor(local * float2(90.0, 160.0)) + floor(t * 24.0)));
+    red += float3(snow * 0.03, snow * 0.006, snow * 0.003);
+    return saturate(red);
+}
+
+/// Trail buffer is stamped in screen space; apply lighter VHS on read.
+float3 cameraBlackRedTrail(float2 uvScreen, float2 res, constant Uniforms &u,
+                           texture2d<float> trailTex, sampler trailSamp) {
+    float2 local;
+    if (!cameraSquareLocal(uvScreen, res, u, local)) return float3(0.0);
+
+    float2 warped = warpCameraLocal(local, res, u);
+    // Remap warped local back toward screen UV inside the square for trail lookup
+    float side = min(res.x, res.y) * cameraSquareSizeFrac(u);
+    float2 origin = cameraSquareOriginUV(u) * res;
+    float2 sampleUV = (origin + warped * side) / res;
+    float3 rgb = trailTex.sample(trailSamp, clamp(sampleUV, 0.001, 0.999)).rgb;
+    float3 red = cameraLumaToRed(rgb);
+    float scan = 0.96 + 0.04 * sin(local.y * res.y * 3.14159);
+    red *= scan;
+    return saturate(red);
+}
+
+/// Live camera + gentle strided decay-trail overlay, under the warped VHS plate.
+float3 compositeCameraUnder(float3 vhsCol, float2 uvScreen, float2 res,
+                            constant Uniforms &u,
+                            texture2d<float> camLive, sampler liveSamp,
+                            texture2d<float> camTrail, sampler trailSamp) {
+    // lavaHot.w already includes presence opacity from the CPU (0 when camera is gone).
+    float camStr = u.lavaHot.w;
+    if (camStr < 0.001) return vhsCol;
+    float trailAmt = saturate(u.lavaHot.z > 0.001 ? u.lavaHot.z : 0.18);
+    float3 live = cameraBlackRedLive(uvScreen, res, u, camLive, liveSamp) * camStr;
+    float3 trail = cameraBlackRedTrail(uvScreen, res, u, camTrail, trailSamp) * camStr * trailAmt;
+    // Soft screen of trail over live — ghosts past frames without washing the present
+    float3 under = 1.0 - (1.0 - saturate(live)) * (1.0 - saturate(trail));
+    float cover = saturate(u.lavaMid.w > 0.001 ? u.lavaMid.w : 0.78);
+    float3 col = mix(under, vhsCol, cover);
+    // Light screen only — let the MP4 plate dominate
+    col = 1.0 - (1.0 - saturate(col)) * (1.0 - saturate(under) * 0.22);
+    float vL = saturate(dot(vhsCol, float3(0.299, 0.587, 0.114)));
+    col = mix(max(col, under * 0.45), col, smoothstep(0.0, 0.25, vL));
+    return saturate(col);
+}
+
+/// VHS background: video + noise + bloom only (camera is composited after warp).
 float3 renderBackground(float2 uvScreen, constant Uniforms &u, bool withBloom,
                         texture2d<float> videoTex, sampler videoSamp,
                         texture2d<float> camEMA, sampler camSamp) {
     float2 res = max(u.resolution, float2(1.0));
     float t = u.time;
-
-    // lavaHot.w = camera strength, lavaMid.w = video cover over camera.
-    float3 under = cameraBlackRed(uvScreen, res, camEMA, camSamp)
-                 * saturate(u.lavaHot.w > 0.001 ? u.lavaHot.w : 0.9);
+    (void)camEMA; (void)camSamp;
 
     float2 ouv = float2(uvScreen.x, 1.0 - uvScreen.y);
     float2 frag = ouv * res;
@@ -505,15 +615,14 @@ float3 renderBackground(float2 uvScreen, constant Uniforms &u, bool withBloom,
         col = (col + bloomSample * bloomIntensity) * 0.5;
     }
 
-    // Kick lifts background video brightness from 0.8 → 1.0
+    // Kick lifts background video brightness and contrast
     float kick = kickAmount(u);
-    col *= mix(0.8, 1.0, kick);
+    col *= mix(0.72, 1.12, kick);
+    col = mix(col, col * col * 1.15, kick * 0.35);
 
-    float cover = saturate(u.lavaMid.w > 0.001 ? u.lavaMid.w : 0.72);
-    col = mix(under, col, cover);
-    // Extra camera presence in dark regions so the underlay reads as the bottom layer
-    float vL = saturate(dot(col, float3(0.299, 0.587, 0.114)));
-    col = mix(max(col, under), col, smoothstep(0.0, 0.28, vL));
+    // GIF-like presence gate (lavaMid.y): fade the MP4 plate in/out
+    float vidOp = saturate(u.lavaMid.y);
+    col *= vidOp;
     return saturate(col);
 }
 
@@ -524,13 +633,18 @@ float3 applyGifSticker(float3 col, float2 metalUV, float2 res, constant Uniforms
     float2 gifSize = u.gifOverlay.zw;
     if (gifOp <= 0.001 || gifSize.x <= 0.001 || gifSize.y <= 0.001) return col;
 
-    float kick = kickAmount(u);
     float2 guv = (metalUV - gifOrigin) / gifSize;
-    // Mild VHS jitter on the sticker UVs (still under the heavy degrade pass)
-    guv.x += (hash21(float2(floor(metalUV.y * res.y), floor(u.time * 20.0))) - 0.5) * 0.02 * kick;
+    // In-rect test before warp so jitter can't erase the sticker
     if (guv.x < 0.0 || guv.x > 1.0 || guv.y < 0.0 || guv.y > 1.0) return col;
 
-    float4 g = gifTex.sample(gifSamp, clamp(guv, 0.0, 1.0));
+    // Soft kick curve: quiet beats barely move it; only strong hits smear
+    float kick = kickAmount(u);
+    float gifKick = pow(saturate(kick), 2.4);
+    float amp = 0.010 * gifKick; // was 0.02 * linear kick
+    guv.x += (hash21(float2(floor(metalUV.y * res.y), floor(u.time * 20.0))) - 0.5) * amp;
+    guv = clamp(guv, 0.0, 1.0);
+
+    float4 g = gifTex.sample(gifSamp, guv);
     float a = saturate(g.a) * gifOp;
     float3 screened = 1.0 - (1.0 - col) * (1.0 - g.rgb);
     return mix(col, mix(g.rgb, screened, 0.45), a);
@@ -556,9 +670,9 @@ float sampleLogoWrapped(float2 logoUV, texture2d<float> logoTex, sampler logoSam
 float logoGaussian(float2 logoUV, texture2d<float> logoTex, sampler logoSamp,
                    float sigma, float rollOffset, float time, float noiseAmt) {
     sigma = max(sigma, 0.004);
-    // 9×9 kernel, sample spacing ≈ σ/2 → ~±2σ coverage
-    const int R = 4;
-    float stepUV = sigma * 0.5;
+    // 5×5 kernel (was 9×9) — plenty for a soft halo at capped render res
+    const int R = 2;
+    float stepUV = sigma * 0.65;
     float inv2s2 = 1.0 / (2.0 * sigma * sigma);
     float sum = 0.0;
     float wsum = 0.0;
@@ -566,14 +680,12 @@ float logoGaussian(float2 logoUV, texture2d<float> logoTex, sampler logoSamp,
     for (int y = -R; y <= R; ++y) {
         for (int x = -R; x <= R; ++x) {
             float2 d = float2(float(x), float(y)) * stepUV;
-            // Jitter sample positions with animated grain
             float2 j = float2(
                 hash21(float2(logoUV.x * 90.0 + float(x), tFrame + float(y) * 3.1)),
                 hash21(float2(logoUV.y * 90.0 + float(y), tFrame * 1.7 + float(x) * 5.3))
             ) - 0.5;
             d += j * stepUV * 1.4 * noiseAmt;
             float w = exp(-dot(d, d) * inv2s2);
-            // Per-tap weight noise (film grain in the bloom)
             float nw = 1.0 + (hash21(float2(float(x) + tFrame, float(y) * 7.0 + logoUV.x * 40.0)) - 0.5) * 1.6 * noiseAmt;
             w *= max(nw, 0.05);
             sum += sampleLogoWrapped(logoUV + d, logoTex, logoSamp, 0.0, rollOffset) * w;
@@ -669,37 +781,32 @@ float3 applyLogo(float3 col, float2 fragPx, constant Uniforms &u,
 }
 
 /// Full frame at a screen UV (Y-down). Neighbors skip bloom for performance.
-/// texture2 = GIF sticker; texture3 = camera EMA. Logo is applied in the degrade pass.
+/// GIF stickers are composited after chroma (still under the degrade pass).
 float3 renderEverything(float2 uvScreen, float2 fragPx, constant Uniforms &u,
                         texture2d<float> logoTex, sampler logoSamp,
                         texture2d<float> videoTex, sampler videoSamp,
-                        texture2d<float> gifTex, sampler gifSamp,
                         texture2d<float> camEMA, sampler camSamp,
                         bool withBloom) {
-    float3 col = renderBackground(uvScreen, u, withBloom, videoTex, videoSamp, camEMA, camSamp);
-    // GIFs sit under chroma / degrade; logo is applied in the degrade pass.
-    return applyGifSticker(col, uvScreen, max(u.resolution, float2(1.0)), u, gifTex, gifSamp);
+    return renderBackground(uvScreen, u, withBloom, videoTex, videoSamp, camEMA, camSamp);
 }
 
-/// Chroma blur / smear (YUV horizontal accumulate) — applied on top of everything.
+/// Chroma blur / smear (YUV horizontal accumulate) — video only; GIFs applied after.
 float3 chromaBlur(float2 fragCoord, float2 res, float time,
                   constant Uniforms &u,
                   texture2d<float> logoTex, sampler logoSamp,
                   texture2d<float> videoTex, sampler videoSamp,
-                  texture2d<float> gifTex, sampler gifSamp,
                   texture2d<float> camEMA, sampler camSamp) {
     float color_resX = 7.0;
     float chromaBias = 30.0;
-    // Kicks widen the chroma smear
+    // Kicks widen the chroma smear (soft curve so mid-level kicks don't obliterate detail)
     float kick = kickAmount(u);
-    chromaBias += kick * 18.0;
+    chromaBias += pow(kick, 1.6) * 10.0;
 
     int color_res = int((sin(time + fragCoord.y / 10.0) + 1.1) * color_resX + chromaBias);
-    color_res = clamp(color_res, 1, 48);
+    color_res = clamp(color_res, 1, 20);
 
     float2 uv = fragCoord / res;
-    // fragCoord is Y-down framebuffer space matching in.position
-    float3 center = renderEverything(uv, fragCoord, u, logoTex, logoSamp, videoTex, videoSamp, gifTex, gifSamp, camEMA, camSamp, true);
+    float3 center = renderEverything(uv, fragCoord, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp, true);
     float Y = 0.299 * center.r + 0.587 * center.g + 0.114 * center.b;
 
     float2 colorData = float2(0.0);
@@ -709,7 +816,7 @@ float3 chromaBlur(float2 fragCoord, float2 res, float time,
         if (int(fragCoord.x) - i > 0) {
             float2 fragI = float2(fragCoord.x - float(i), fragCoord.y);
             float2 uvI = fragI / res;
-            float3 sampled = rgb2yuv(renderEverything(uvI, fragI, u, logoTex, logoSamp, videoTex, videoSamp, gifTex, gifSamp, camEMA, camSamp, false));
+            float3 sampled = rgb2yuv(renderEverything(uvI, fragI, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp, false));
             if (length(sampled.yz) > 0.02) {
                 colorData += sampled.yz;
                 samples += 1;
@@ -732,13 +839,15 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
                               sampler camSamp [[sampler(3)]]) {
     float2 res = max(u.resolution, float2(1.0));
     float2 fragCoord = in.position.xy;
-    // Camera underlay + video + GIFs + chroma (degrade is a second pass)
-    float3 col = chromaBlur(fragCoord, res, u.time, u, logoTex, logoSamp, videoTex, videoSamp, gifTex, gifSamp, camEMA, camSamp);
+    // Video + chroma, then GIFs (still under degrade pass 2)
+    float3 col = chromaBlur(fragCoord, res, u.time, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp);
+    col = applyGifSticker(col, fragCoord / res, res, u, gifTex, gifSamp);
     return float4(col, 1.0);
 }
 
-/// Camera EMA: sample every stride frame; idle frames decay history faster.
-/// liquidCam.x = alpha, .y = idle decay (EMA pass only), .w = stride flag (0/1).
+/// Strided decay trail: stamp live camera every N frames into the inset square; idle fades.
+/// Live frame is composited separately — this buffer is only the ghost overlay.
+/// liquidCam.x = stamp alpha, .y = idle decay, .w = stride flag (0/1).
 fragment float4 fragment_camera_ema(VertexOut in [[stage_in]],
                                     constant Uniforms &u [[buffer(0)]],
                                     texture2d<float> prevEMA [[texture(0)]],
@@ -749,19 +858,22 @@ fragment float4 fragment_camera_ema(VertexOut in [[stage_in]],
     float2 res = max(u.resolution, float2(1.0));
     float3 prev = prevEMA.sample(prevSamp, uv).rgb;
     float idleDecay = saturate(u.liquidCam.y);
-    float stride = u.liquidCam.w; // 1 = pull new camera sample this frame
+    float3 decayed = prev * idleDecay;
 
-    if (stride < 0.5) {
-        return float4(prev * idleDecay, 1.0);
+    float2 local;
+    if (!cameraSquareLocal(uv, res, u, local)) {
+        return float4(decayed, 1.0); // clear outside the square over time
     }
 
-    float2 camSize = float2(cameraTex.get_width(), cameraTex.get_height());
-    float2 camUV = aspectFillUV(uv, camSize, res);
-    float3 cam = cameraTex.sample(cameraSamp, camUV).rgb; // store non-inverted
+    float stride = u.liquidCam.w; // 1 = stamp a new sample this frame
+    if (stride < 0.5) {
+        return float4(decayed, 1.0);
+    }
+
+    // Stamp a lightly warped camera sample so the trail carries VHS motion
+    float3 cam = sampleCameraVHSRGB(local, res, u, cameraTex, cameraSamp);
     float a = saturate(u.liquidCam.x);
-    // Kick briefly pulls EMA toward the new frame
-    a = saturate(a + kickAmount(u) * 0.12);
-    float3 decayed = prev * idleDecay;
+    a = saturate(a + kickAmount(u) * 0.08);
     return float4(mix(decayed, cam, a), 1.0);
 }
 
@@ -796,17 +908,18 @@ float3 degradeSaturate(float3 col, float amount) {
 }
 
 float3 softBufferD(texture2d<float> src, sampler srcSamp, float2 uv, float intensity) {
-    // Cheap stand-in for Buffer D blur/sharpen/vignette (full conv is impractical).
+    // Cheap stand-in for Buffer D blur/sharpen/vignette.
     float2 px = 1.0 / max(float2(src.get_width(), src.get_height()), float2(1.0));
     float skips = max(intensity * 2.0, 0.15);
     float3 total = float3(0.0);
     float wsum = 0.0;
-    for (int y = -2; y <= 2; ++y) {
-        for (int x = -4; x <= 4; ++x) {
+    // 3×5 kernel (was 5×9)
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -2; x <= 2; ++x) {
             float2 off = float2(float(x), float(y) * 0.35) * skips * px * 8.0;
             float2 p = clamp(uv + off, float2(0.001), float2(0.999));
             float3 s = src.sample(srcSamp, p).rgb;
-            float dist = length(float2(float(x) / 4.0, float(y) / 2.0));
+            float dist = length(float2(float(x) / 2.0, float(y)));
             float w = max(1.0 - dist, 0.0);
             w = w * w;
             float g = (s.r + s.g + s.b) * (1.0 / 3.0);
@@ -835,7 +948,11 @@ fragment float4 fragment_vhs_degrade(VertexOut in [[stage_in]],
                                      texture2d<float> sceneTex [[texture(0)]],
                                      sampler sceneSamp [[sampler(0)]],
                                      texture2d<float> logoTex [[texture(1)]],
-                                     sampler logoSamp [[sampler(1)]]) {
+                                     sampler logoSamp [[sampler(1)]],
+                                     texture2d<float> camLive [[texture(2)]],
+                                     sampler liveSamp [[sampler(2)]],
+                                     texture2d<float> camTrail [[texture(3)]],
+                                     sampler trailSamp [[sampler(3)]]) {
     float2 res = max(u.resolution, float2(1.0));
     float2 fragCoord = in.position.xy;
     // Shadertoy Y-up for Image math
@@ -917,6 +1034,9 @@ fragment float4 fragment_vhs_degrade(VertexOut in [[stage_in]],
         // Soft additive haze that lifts dark areas without crushing highlights
         col += glow * glowAmt * (0.65 + 0.35 * (1.0 - saturate(col)));
     }
+
+    // Unwarped live camera + gentle decay-trail overlay under the warped VHS plate.
+    col = compositeCameraUnder(col, metalUV, res, u, camLive, liveSamp, camTrail, trailSamp);
 
     // DSNK on top — light base tracking, stronger kick shear (lavaTrough.w = vhsLogoBeatWarp).
     float logoWarp = u.lavaTrough.w > 0.001 ? u.lavaTrough.w : 0.55;
