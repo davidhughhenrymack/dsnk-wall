@@ -58,11 +58,11 @@ struct Uniforms {
     float beatDistortionBoost;
     float beatBrightnessBoost;
 
-    // .w = vhsLogoBeatWarp; .xyz unused padding
+    // .x = logo roll offset (0…1), .y = roll velocity, .w = vhsLogoBeatWarp
     float4 lavaTrough;
-    // .w = vhsVideoOverCamera; .xyz unused padding
+    // .x = logoGlowNoise, .w = vhsVideoOverCamera
     float4 lavaMid;
-    // .w = vhsCameraStrength; .xyz unused padding
+    // .x = logoScanJitter, .w = vhsCameraStrength
     float4 lavaHot;
 
     // .x = degrade intensity, .y = beat boost, .z = glow intensity, .w = glow radius (UV)
@@ -505,8 +505,9 @@ float3 renderBackground(float2 uvScreen, constant Uniforms &u, bool withBloom,
         col = (col + bloomSample * bloomIntensity) * 0.5;
     }
 
+    // Kick lifts background video brightness from 0.8 → 1.0
     float kick = kickAmount(u);
-    col *= 1.0 + kick * u.beatBrightnessBoost * 0.35;
+    col *= mix(0.8, 1.0, kick);
 
     float cover = saturate(u.lavaMid.w > 0.001 ? u.lavaMid.w : 0.72);
     col = mix(under, col, cover);
@@ -535,8 +536,25 @@ float3 applyGifSticker(float3 col, float2 metalUV, float2 res, constant Uniforms
     return mix(col, mix(g.rgb, screened, 0.45), a);
 }
 
-/// Mild 2D Gaussian of the logo mask in logo-UV space (σ = logoGlowRadius).
-float logoGaussian(float2 logoUV, texture2d<float> logoTex, sampler logoSamp, float sigma) {
+/// Wrap logo V so top/bottom edges connect (old TV vertical roll).
+float2 logoRollUV(float2 logoUV, float rollOffset) {
+    float2 uv = logoUV;
+    uv.y = fract(uv.y + rollOffset);
+    return uv;
+}
+
+float sampleLogoWrapped(float2 logoUV, texture2d<float> logoTex, sampler logoSamp,
+                        float mipLevel, float rollOffset) {
+    // X still hard-clipped; Y wraps through the roll
+    if (logoUV.x < 0.0 || logoUV.x > 1.0) return 0.0;
+    float2 uv = logoRollUV(logoUV, rollOffset);
+    return logoTex.sample(logoSamp, uv, level(mipLevel)).r;
+}
+
+/// Mild 2D Gaussian of the logo mask in logo-UV space (σ = logoGlowRadius),
+/// with per-tap jitter so the bloom reads as noisy / taped.
+float logoGaussian(float2 logoUV, texture2d<float> logoTex, sampler logoSamp,
+                   float sigma, float rollOffset, float time, float noiseAmt) {
     sigma = max(sigma, 0.004);
     // 9×9 kernel, sample spacing ≈ σ/2 → ~±2σ coverage
     const int R = 4;
@@ -544,11 +562,21 @@ float logoGaussian(float2 logoUV, texture2d<float> logoTex, sampler logoSamp, fl
     float inv2s2 = 1.0 / (2.0 * sigma * sigma);
     float sum = 0.0;
     float wsum = 0.0;
+    float tFrame = floor(time * 24.0);
     for (int y = -R; y <= R; ++y) {
         for (int x = -R; x <= R; ++x) {
             float2 d = float2(float(x), float(y)) * stepUV;
+            // Jitter sample positions with animated grain
+            float2 j = float2(
+                hash21(float2(logoUV.x * 90.0 + float(x), tFrame + float(y) * 3.1)),
+                hash21(float2(logoUV.y * 90.0 + float(y), tFrame * 1.7 + float(x) * 5.3))
+            ) - 0.5;
+            d += j * stepUV * 1.4 * noiseAmt;
             float w = exp(-dot(d, d) * inv2s2);
-            sum += sampleLogoGlow(logoUV + d, logoTex, logoSamp, 0.0) * w;
+            // Per-tap weight noise (film grain in the bloom)
+            float nw = 1.0 + (hash21(float2(float(x) + tFrame, float(y) * 7.0 + logoUV.x * 40.0)) - 0.5) * 1.6 * noiseAmt;
+            w *= max(nw, 0.05);
+            sum += sampleLogoWrapped(logoUV + d, logoTex, logoSamp, 0.0, rollOffset) * w;
             wsum += w;
         }
     }
@@ -561,27 +589,44 @@ float3 applyLogo(float3 col, float2 fragPx, constant Uniforms &u,
     if (u.logoSize.x <= 2.0 || u.logoSize.y <= 2.0) return col;
 
     float kick = kickAmount(u);
+    float rollOffset = u.lavaTrough.x;
+    float rollVel = u.lavaTrough.y;
     // distortionScale = beat zoom, distortionStrength = zoom-blur amount
     float beatZoom = 1.0 - kick * saturate(u.distortionScale);
     float2 logoUV = (fragPx - u.logoOrigin) / u.logoSize;
     logoUV = (logoUV - 0.5) / max(beatZoom, 0.75) + 0.5;
 
+    // Very gentle GIF-style per-scanline horizontal jitter (lavaHot.x = logoScanJitter)
+    float scanJitter = u.lavaHot.x > 0.0 ? u.lavaHot.x : 0.006;
+    logoUV.x += (hash21(float2(floor(fragPx.y), floor(u.time * 20.0))) - 0.5)
+              * scanJitter * (0.35 + kick * 0.9);
+
     float sigma = max(u.logoGlowRadius, 0.004);
     float zoomBlurAmt = max(u.distortionStrength, 0.0) * (0.25 + kick * 0.9);
+    // distortionSpeed packs logoRollMotionBlur scale
+    float rollBlur = abs(rollVel) * max(u.distortionSpeed, 0.0);
     float margin = sigma * 3.0 + zoomBlurAmt * 1.5 + 0.04;
-    if (logoUV.x < -margin || logoUV.x > 1.0 + margin ||
-        logoUV.y < -margin || logoUV.y > 1.0 + margin) {
+    // Y wraps, so only cull on X (plus a little margin for glow/zoom)
+    if (logoUV.x < -margin || logoUV.x > 1.0 + margin) {
+        return col;
+    }
+    if (logoUV.y < -0.15 || logoUV.y > 1.15) {
         return col;
     }
 
-    // Soft Gaussian bloom behind the sharp glyph
-    float blurred = logoGaussian(logoUV, logoTex, logoSamp, sigma);
-    float sharpRef = sampleLogoGlow(logoUV, logoTex, logoSamp, 0.0);
+    // Soft noisy Gaussian bloom behind the sharp glyph (rolls with the logo).
+    // lavaMid.x packs logoGlowNoise when set; fall back to a mild default.
+    float glowNoise = u.lavaMid.x > 0.001 ? u.lavaMid.x : 0.45;
+    float blurred = logoGaussian(logoUV, logoTex, logoSamp, sigma, rollOffset, u.time, glowNoise);
+    float sharpRef = sampleLogoWrapped(logoUV, logoTex, logoSamp, 0.0, rollOffset);
     float halo = saturate(blurred - sharpRef * 0.85);
-    halo *= u.logoGlowIntensity * (0.9 + kick * 0.25);
+    // Spatial grain on the halo itself
+    float grain = hash21(floor(logoUV * 220.0) + floor(u.time * 18.0));
+    halo *= mix(1.0, 0.55 + grain * 0.9, glowNoise);
+    halo *= u.logoGlowIntensity * (0.75 + kick * 0.2);
     col += float3(1.05, 1.0, 1.08) * halo;
 
-    // Mild radial zoom blur on kick (samples along ray from logo center)
+    // Mild radial zoom blur on kick + vertical motion blur from roll velocity
     float2 dir = logoUV - 0.5;
     float m = 0.0;
     float wsum = 0.0;
@@ -591,7 +636,8 @@ float3 applyLogo(float3 col, float2 fragPx, constant Uniforms &u,
         float w = 1.0 - abs(f);
         w *= w;
         float2 suv = logoUV + dir * (f * zoomBlurAmt);
-        m += sampleLogo(suv, logoTex, logoSamp, abs(f) * 0.8) * w;
+        suv.y += f * rollBlur * sign(rollVel + 1e-5);
+        m += sampleLogoWrapped(suv, logoTex, logoSamp, abs(f) * 0.8, rollOffset) * w;
         wsum += w;
     }
     m /= max(wsum, 1e-4);
@@ -610,9 +656,11 @@ float3 applyLogo(float3 col, float2 fragPx, constant Uniforms &u,
         px.x += (hash21(float2(floor(px.y * 0.5), floor(t * 12.0))) - 0.5) * 3.5 * warp * kick;
         float2 warpedUV = (px - u.logoOrigin) / u.logoSize;
         warpedUV = (warpedUV - 0.5) / max(beatZoom, 0.75) + 0.5;
-        float sharp = sampleLogo(warpedUV, logoTex, logoSamp, 0.0);
+        float sharp = sampleLogoWrapped(warpedUV, logoTex, logoSamp, 0.0, rollOffset);
         // Prefer sheared sample for solid fill; keep zoom-blur soft edges
         m = max(m * (0.55 + kick * 0.35), sharp);
+    } else {
+        m = max(m, sampleLogoWrapped(logoUV, logoTex, logoSamp, 0.0, rollOffset));
     }
 
     float mask = smoothstep(0.32, 0.52, m);

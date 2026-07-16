@@ -56,12 +56,12 @@ struct GPUUniforms {
     var beatDistortionBoost: Float
     var beatBrightnessBoost: Float
 
-    // float4 in Metal. .w slots used by VHS; .xyz unused padding.
-    /// .w = vhsLogoBeatWarp
+    // float4 in Metal. Packed VHS extras in components.
+    /// .x = logo roll offset, .y = roll velocity, .w = vhsLogoBeatWarp
     var lavaTrough: SIMD4<Float>
-    /// .w = vhsVideoOverCamera
+    /// .x = logoGlowNoise, .w = vhsVideoOverCamera
     var lavaMid: SIMD4<Float>
-    /// .w = vhsCameraStrength
+    /// .x = logoScanJitter, .w = vhsCameraStrength
     var lavaHot: SIMD4<Float>
 
     /// .x = degrade intensity, .y = beat boost, .z = glow intensity, .w = glow radius
@@ -86,6 +86,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let cameraCapture: CameraCapture
     let gifOverlay: GifOverlay
     let audioBeat: AudioBeat
+    let logoRoll: LogoRollPhysics
 
     private var startTime: CFTimeInterval
     private var viewportSize = SIMD2<Float>(1, 1)
@@ -133,6 +134,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
         self.gifOverlay = gifs
+        self.logoRoll = LogoRollPhysics()
 
         guard let fallbackCam = Self.makeSolidTexture(device: device) else { return nil }
         self.fallbackCamTexture = fallbackCam
@@ -284,6 +286,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         let w = viewportSize.x
         let h = viewportSize.y
         gifOverlay.update(time: now, viewport: viewportSize, beatPulse: audioBeat.beatPulse)
+        let roll = logoRoll.update(now: now, beatPulse: audioBeat.beatPulse)
         // Logo rect in framebuffer pixels, origin = top-left (Metal Y-down).
         let side = Config.logoMaxFraction * min(w, h)
         let logoOrigin = SIMD2<Float>((w - side) * 0.5, (h - side) * 0.5)
@@ -324,14 +327,14 @@ final class Renderer: NSObject, MTKViewDelegate {
             lavaGlowStrength: 0,
             distortionStrength: Config.logoZoomBlur,
             distortionScale: Config.logoBeatZoom,
-            distortionSpeed: Config.distortionSpeed,
+            distortionSpeed: Config.logoRollMotionBlur,
             logoGlowIntensity: Config.logoGlowIntensity,
             logoGlowRadius: Config.logoGlowRadius,
             beatDistortionBoost: Config.beatDistortionBoost,
             beatBrightnessBoost: Config.beatBrightnessBoost,
-            lavaTrough: SIMD4<Float>(0, 0, 0, Config.vhsLogoBeatWarp),
-            lavaMid: SIMD4<Float>(0, 0, 0, Config.vhsVideoOverCamera),
-            lavaHot: SIMD4<Float>(0, 0, 0, Config.vhsCameraStrength),
+            lavaTrough: SIMD4<Float>(roll.offset, roll.velocity, 0, Config.vhsLogoBeatWarp),
+            lavaMid: SIMD4<Float>(Config.logoGlowNoise, 0, 0, Config.vhsVideoOverCamera),
+            lavaHot: SIMD4<Float>(Config.logoScanJitter, 0, 0, Config.vhsCameraStrength),
             vhsDegrade: SIMD4<Float>(
                 Config.vhsDegradeIntensity,
                 Config.vhsDegradeBeatBoost,

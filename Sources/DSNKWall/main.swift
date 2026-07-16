@@ -26,7 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "DSNK Wall"
+        window.title = ""
         window.titlebarAppearsTransparent = true
         window.backgroundColor = .black
         window.delegate = self

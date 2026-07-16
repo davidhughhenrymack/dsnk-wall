@@ -112,16 +112,38 @@ enum Config {
     static let distortionStrength: Float = 0
     static let distortionScale: Float = 3.5
     static let distortionSpeed: Float = 0.6
-    /// Soft Gaussian glow strength around DSNK (additive).
-    static let logoGlowIntensity: Float = 0.55
+    /// Soft Gaussian glow strength around DSNK (additive; lower = more transparent).
+    static let logoGlowIntensity: Float = 0.38
     /// Gaussian σ in logo UV space (mild bloom).
     static let logoGlowRadius: Float = 0.028
+    /// Grain amount mixed into the logo Gaussian glow (0…1).
+    static let logoGlowNoise: Float = 0.45
     /// Mild scale-up of DSNK on kick (0…0.2).
     static let logoBeatZoom: Float = 0.07
     /// Radial zoom-blur amount on kick (logo UV units).
     static let logoZoomBlur: Float = 0.035
     /// VHS: horizontal tracking / shear on DSNK (boosted further by kick).
     static let vhsLogoBeatWarp: Float = 0.55
+    /// Gentle GIF-style per-scanline horizontal jitter on DSNK (UV units × kick).
+    static let logoScanJitter: Float = 0.006
+
+    // MARK: - Logo vertical roll (old TV hold)
+
+    /// Mass of the logo in the roll spring-mass sim (higher = heavier / slower).
+    static let logoRollMass: Float = 1.35
+    /// Spring stiffness pulling the logo back to upright / center.
+    static let logoRollSpring: Float = 9.5
+    /// Velocity damping (friction).
+    static let logoRollDamping: Float = 2.8
+    /// Upward impulse magnitude on a strong kick (logo-heights / sec).
+    static let logoRollImpulse: Float = 13.6
+    /// Minimum seconds between roll impulses (~1 min).
+    static let logoRollMinGap: Float = 55.0
+    static let logoRollMaxGap: Float = 70.0
+    /// Kick pulse must exceed this to trigger a roll (after the gap).
+    static let logoRollKickThreshold: Float = 0.72
+    /// Vertical motion-blur amount scaled by |roll velocity|.
+    static let logoRollMotionBlur: Float = 0.045
 
     // MARK: - Beat
 
