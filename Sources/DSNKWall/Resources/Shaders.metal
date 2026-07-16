@@ -1,19 +1,18 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Pipeline:
-//   1) Looping VHS test-screen video
-//   2) VHS noise pass (Shadertoy port, procedural noise channels)
-//   3) Bloom pass
-//   4) Sharp DSNK logo overlay
-//   5) Chroma blur (VHS mode)
-//   6) VHS degradation layer (Shadertoy 7clXDX Image + soft Buffer D) — second pass
+// Pipeline (VHS):
+//   1) Looping VHS test-screen video + noise + bloom
+//   2) Y2K GIF stickers (under distortion)
+//   3) Chroma blur
+//   4) VHS degradation layer (Shadertoy 7clXDX) — second pass
+//   5) Sharp DSNK logo on top (light shear only)
 
 struct Uniforms {
     float time;
     float beatPulse;
     float beatLevel;
-    float visualMode; // 0 = VHS, 1 = Liquid Metal
+    float visualMode; // unused (ABI padding)
 
     float2 resolution;
     float2 logoOrigin;
@@ -59,14 +58,17 @@ struct Uniforms {
     float beatDistortionBoost;
     float beatBrightnessBoost;
 
+    // .w = vhsLogoBeatWarp; .xyz unused padding
     float4 lavaTrough;
+    // .w = vhsVideoOverCamera; .xyz unused padding
     float4 lavaMid;
+    // .w = vhsCameraStrength; .xyz unused padding
     float4 lavaHot;
 
     // .x = degrade intensity, .y = beat boost, .z = glow intensity, .w = glow radius (UV)
     float4 vhsDegrade;
 
-    // .x = camera EMA alpha, .y = lighten strength, .z = liquid sound drive, .w = gif opacity (VHS)
+    // .x = camera EMA alpha, .y = idle decay (EMA pass), .z unused, .w = gif opacity
     float4 liquidCam;
 
     // VHS Y2K GIF sticker: xy = top-left UV (Y-down), zw = size UV
@@ -258,44 +260,6 @@ float3 darkDashBand(float2 uv, float2 res, float time, float stability, float sh
     return col;
 }
 
-// ------------------------------------------------------------
-// D) Liquid VHS — by Leon Denise (2023/08/18), Metal port
-//    Palette forced to pink↔white (no blacks) via u.lavaTrough / lavaMid / lavaHot
-// ------------------------------------------------------------
-
-float liquidGyroid(float3 seed) {
-    return dot(sin(seed), cos(seed.yzx));
-}
-
-float liquidFbm(float3 seed) {
-    float result = 0.0, a = 0.5;
-    for (int i = 0; i < 4; ++i, a /= 2.0) {
-        seed.z += result * 2.5;
-        result += liquidGyroid(seed / a) * a;
-    }
-    return result;
-}
-
-float liquidFbm2(float3 seed) {
-    float result = 0.0, a = 0.5;
-    for (int i = 0; i < 4; ++i, a /= 2.0) {
-        seed.z += result * 0.5;
-        result += liquidGyroid(seed / a) * a;
-    }
-    return result;
-}
-
-float liquidHeight(float3 pos, float d, float time) {
-    float f = liquidFbm(pos) * 0.5 + 0.5;
-    d = max(0.0, d - 0.2);
-    float thin1 = 0.5 + sin(d * 12.0 - time) * 0.1;
-    float thin2 = d * 0.1;
-    f = abs(abs(abs(f) - thin1) - thin2) - 0.1;
-    // Original Shadertoy: smoothstep(.01, -.1, x) — Metal requires edge0 < edge1
-    float x = f - d * 0.05;
-    return 1.0 - smoothstep(-0.1, 0.01, x);
-}
-
 float2 aspectFillUV(float2 uv, float2 texSize, float2 viewSize) {
     if (texSize.x < 2.0 || texSize.y < 2.0) return uv;
     float va = texSize.x / max(texSize.y, 1.0);
@@ -309,106 +273,8 @@ float2 aspectFillUV(float2 uv, float2 texSize, float2 viewSize) {
     return clamp(suv, float2(0.001), float2(0.999));
 }
 
-/// `uv` is Y-down screen UV (0,0 = top-left). Internally converted to Shadertoy space.
-/// Under-glass: inverted camera EMA lightened onto pink. Glass layer on top.
-/// Color field stays pink→white (`dark` is the pink floor — never black).
-float3 liquidVHS(float2 uv, float2 res, float time, float beat, float level,
-                 float3 dark, float3 pink, float3 white,
-                 float lightenStrength, float soundDrive,
-                 texture2d<float> camEMA, sampler camSamp) {
-    float drive = max(soundDrive, 0.1);
-    float kick = saturate(beat + level * 0.55);
-    float t = time * (1.0 + kick * 0.85 * drive);
-    float anim = 1.0 + kick * 1.4 * drive;
-
-    // Shadertoy-style coords (Y-up)
-    float2 frag = float2(uv.x * res.x, (1.0 - uv.y) * res.y);
-    float2 R = res;
-    float2 p = (2.0 * frag - R) / max(R.y, 1.0);
-    float a = atan2(p.y, p.x) + t * 0.1 * anim;
-    float d = length(p);
-
-    float3 pos = float3(p, d * 0.5);
-    pos.z -= t * 0.01 * anim;
-
-    float h = liquidHeight(pos, d, t);
-    h = saturate(h + kick * 0.12 * drive);
-
-    float2 e2 = float2(1.0 / max(R.x, 1.0), 0.0);
-    float hx = liquidHeight(pos + float3(-e2.x, 0.0, 0.0), d, t)
-             - liquidHeight(pos + float3( e2.x, 0.0, 0.0), d, t);
-    float hy = liquidHeight(pos + float3(0.0, -e2.x, 0.0), d, t)
-             - liquidHeight(pos + float3(0.0,  e2.x, 0.0), d, t);
-    float3 n = normalize(float3(hx, hy, 0.2 / max(0.001, d - 0.2)));
-
-    float wave = 0.5 + 0.5 * cos(a * 2.0 + t * 0.3 + kick * 2.0);
-    float3 tint = mix(pink, white, wave);
-    tint = mix(white, tint, smoothstep(0.0, 0.5, d));
-
-    // Glass lighting
-    float l = max(0.0, dot(n, -normalize(float3(p, -1.0))));
-    l *= smoothstep(-0.5, 0.2, d);
-    l = saturate(l + kick * 0.2 * drive);
-    float shade = pow(l, 1.6) * pow(max(1.0 - h, 0.0), 3.0);
-    shade = saturate(0.35 + shade * 0.65);
-    shade = mix(shade, 1.0, pow(l, 14.0) * 0.55);
-    float3 glass = mix(dark, tint, shade);
-    glass = mix(glass, white, pow(l, 18.0) * smoothstep(0.0, 0.15, h));
-
-    // Curl / bands feed the glass layer
-    float3 e = float3(0.01, 0.0, 0.0);
-    pos = float3(p, 0.0);
-    pos += h * 0.02;
-    pos.x = abs(pos.x) - t * 0.1 * anim + 0.05 / max(0.0, abs(p.x) + 0.1);
-    float x = (liquidFbm2(pos + e.yxy) - liquidFbm2(pos - e.yxy)) / (2.0 * e.x);
-    float y = (liquidFbm2(pos + e.xyy) - liquidFbm2(pos - e.xyy)) / (2.0 * e.x);
-    float2 curl = float2(-x, y) * (1.0 + kick * 0.9 * drive);
-    float2 p2 = p + curl * 0.1 * smoothstep(0.9, 0.0, abs(p.x) - 0.7);
-    float shape = abs(p2.y) - 0.2;
-    float strips = mix(0.8 + 0.2 * sin(uv.y * 1000.0 + t * 10.0 + h * 5.0 + uv.x * 200.0), 1.0, d);
-    float stripAmt = min(1.0, (0.0 + h * 0.1) / max(0.0, shape));
-    glass = mix(glass, mix(pink, white, strips), saturate(stripAmt) * 0.55);
-    glass = mix(glass, pink, h * d * 0.25);
-    float bandA = abs(p2.y) - mix(0.1, 0.01, h);
-    float bandB = abs(p2.y - 0.05) - mix(0.05, 0.01, h);
-    float eA = mix(0.01, 0.1, h);
-    float eB = mix(0.01, 0.1, h);
-    glass = mix(glass, pink, 1.0 - smoothstep(0.0, eA, bandA));
-    glass = mix(glass, white, 1.0 - smoothstep(0.0, eB, bandB));
-
-    float field = saturate(dot(glass, float3(0.299, 0.587, 0.114)));
-    glass = mix(dark, white, field);
-    glass = mix(glass, mix(pink, white, wave), 0.2);
-    glass = mix(glass, white, kick * 0.35 * drive);
-
-    // --- Under-glass: inverted camera EMA, lighten-only onto pink floor ---
-    float2 camSize = float2(camEMA.get_width(), camEMA.get_height());
-    float2 camUV = aspectFillUV(uv, camSize, res);
-    // Slight beat-driven UV jitter on the projection
-    camUV += float2(sin(uv.y * 40.0 + t * 6.0), cos(uv.x * 30.0 - t * 4.0)) * kick * 0.008 * drive;
-    camUV = clamp(camUV, float2(0.001), float2(0.999));
-    float3 cam = camEMA.sample(camSamp, camUV).rgb; // already inverted in EMA pass
-    float camL = saturate(dot(cam, float3(0.299, 0.587, 0.114)));
-    float3 camTint = mix(dark, white, pow(camL, 0.85));
-    float3 under = max(dark, camTint); // Photoshop Lighten
-    under = mix(dark, under, saturate(lightenStrength));
-    under = mix(under, white, kick * 0.2 * drive);
-
-    // Glass mask: thicker on ridges / specular; camera shows through troughs
-    float glassMask = saturate(
-        shade * 0.55
-        + smoothstep(0.05, 0.35, h) * 0.45
-        + pow(l, 10.0) * 0.5
-        + kick * 0.15 * drive
-    );
-    float3 color = mix(under, max(under, glass), glassMask); // glass lightens over under
-    color = mix(color, glass, glassMask * 0.4);
-    return saturate(color);
-}
-
 // ------------------------------------------------------------
-// E) Generative VHS test card + noise pass + bloom
-//     Noise/bloom ported from the provided Shadertoy (procedural tex substitutes)
+// VHS test-screen video + noise pass + bloom
 // ------------------------------------------------------------
 
 #define sat(a) clamp((a), 0.0, 1.0)
@@ -577,6 +443,11 @@ float sampleLogo(float2 logoUV, texture2d<float> logoTex, sampler logoSamp, floa
     return logoTex.sample(logoSamp, logoUV, level(mipLevel)).r;
 }
 
+/// Like sampleLogo but clamps UVs so soft mip / glow taps can bleed at the rect edge.
+float sampleLogoGlow(float2 logoUV, texture2d<float> logoTex, sampler logoSamp, float mipLevel) {
+    return logoTex.sample(logoSamp, clamp(logoUV, 0.0, 1.0), level(mipLevel)).r;
+}
+
 float3 rgb2yuv(float3 rgb) {
     return float3(
         0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b,
@@ -593,27 +464,29 @@ float3 yuv2rgb(float3 yuv) {
     );
 }
 
-/// Background for the active visual mode. No logo.
+/// Black→red remap of camera luminance (VHS underlay).
+float3 cameraBlackRed(float2 uvScreen, float2 res,
+                      texture2d<float> camEMA, sampler camSamp) {
+    float2 camSize = float2(camEMA.get_width(), camEMA.get_height());
+    if (camSize.x < 2.0 || camSize.y < 2.0) return float3(0.0);
+    float2 camUV = aspectFillUV(uvScreen, camSize, res);
+    float3 cam = camEMA.sample(camSamp, camUV).rgb;
+    float lum = saturate(dot(cam, float3(0.299, 0.587, 0.114)));
+    lum = pow(lum, 0.9);
+    return float3(lum, lum * 0.04, lum * 0.02); // black → deep red
+}
+
+/// VHS background: black→red camera underlay + video + noise + bloom. No logo.
 float3 renderBackground(float2 uvScreen, constant Uniforms &u, bool withBloom,
                         texture2d<float> videoTex, sampler videoSamp,
                         texture2d<float> camEMA, sampler camSamp) {
     float2 res = max(u.resolution, float2(1.0));
     float t = u.time;
-    float beat = u.beatPulse;
 
-    // Mode 1: Liquid Metal (camera under glass + pink/white liquid)
-    if (u.visualMode > 0.5) {
-        float3 col = liquidVHS(
-            uvScreen, res, t * u.flowSpeed, beat, u.beatLevel,
-            u.lavaTrough.xyz, u.lavaMid.xyz, u.lavaHot.xyz,
-            u.liquidCam.y, u.liquidCam.z,
-            camEMA, camSamp
-        );
-        col *= 1.0 + kickAmount(u) * u.beatBrightnessBoost * 0.55;
-        return saturate(col);
-    }
+    // lavaHot.w = camera strength, lavaMid.w = video cover over camera.
+    float3 under = cameraBlackRed(uvScreen, res, camEMA, camSamp)
+                 * saturate(u.lavaHot.w > 0.001 ? u.lavaHot.w : 0.9);
 
-    // Mode 0 (default): looping VHS test-screen video + noise + bloom
     float2 ouv = float2(uvScreen.x, 1.0 - uvScreen.y);
     float2 frag = ouv * res;
     float2 uv = (frag - 0.5 * res) / max(res.x, 1.0);
@@ -634,42 +507,130 @@ float3 renderBackground(float2 uvScreen, constant Uniforms &u, bool withBloom,
 
     float kick = kickAmount(u);
     col *= 1.0 + kick * u.beatBrightnessBoost * 0.35;
+
+    float cover = saturate(u.lavaMid.w > 0.001 ? u.lavaMid.w : 0.72);
+    col = mix(under, col, cover);
+    // Extra camera presence in dark regions so the underlay reads as the bottom layer
+    float vL = saturate(dot(col, float3(0.299, 0.587, 0.114)));
+    col = mix(max(col, under), col, smoothstep(0.0, 0.28, vL));
     return saturate(col);
 }
 
+float3 applyGifSticker(float3 col, float2 metalUV, float2 res, constant Uniforms &u,
+                       texture2d<float> gifTex, sampler gifSamp) {
+    float gifOp = u.liquidCam.w;
+    float2 gifOrigin = u.gifOverlay.xy;
+    float2 gifSize = u.gifOverlay.zw;
+    if (gifOp <= 0.001 || gifSize.x <= 0.001 || gifSize.y <= 0.001) return col;
+
+    float kick = kickAmount(u);
+    float2 guv = (metalUV - gifOrigin) / gifSize;
+    // Mild VHS jitter on the sticker UVs (still under the heavy degrade pass)
+    guv.x += (hash21(float2(floor(metalUV.y * res.y), floor(u.time * 20.0))) - 0.5) * 0.02 * kick;
+    if (guv.x < 0.0 || guv.x > 1.0 || guv.y < 0.0 || guv.y > 1.0) return col;
+
+    float4 g = gifTex.sample(gifSamp, clamp(guv, 0.0, 1.0));
+    float a = saturate(g.a) * gifOp;
+    float3 screened = 1.0 - (1.0 - col) * (1.0 - g.rgb);
+    return mix(col, mix(g.rgb, screened, 0.45), a);
+}
+
+/// Mild 2D Gaussian of the logo mask in logo-UV space (σ = logoGlowRadius).
+float logoGaussian(float2 logoUV, texture2d<float> logoTex, sampler logoSamp, float sigma) {
+    sigma = max(sigma, 0.004);
+    // 9×9 kernel, sample spacing ≈ σ/2 → ~±2σ coverage
+    const int R = 4;
+    float stepUV = sigma * 0.5;
+    float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    float sum = 0.0;
+    float wsum = 0.0;
+    for (int y = -R; y <= R; ++y) {
+        for (int x = -R; x <= R; ++x) {
+            float2 d = float2(float(x), float(y)) * stepUV;
+            float w = exp(-dot(d, d) * inv2s2);
+            sum += sampleLogoGlow(logoUV + d, logoTex, logoSamp, 0.0) * w;
+            wsum += w;
+        }
+    }
+    return sum / max(wsum, 1e-4);
+}
+
 float3 applyLogo(float3 col, float2 fragPx, constant Uniforms &u,
-                 texture2d<float> logoTex, sampler logoSamp) {
+                 texture2d<float> logoTex, sampler logoSamp,
+                 float logoWarpScale) {
     if (u.logoSize.x <= 2.0 || u.logoSize.y <= 2.0) return col;
+
+    float kick = kickAmount(u);
+    // distortionScale = beat zoom, distortionStrength = zoom-blur amount
+    float beatZoom = 1.0 - kick * saturate(u.distortionScale);
     float2 logoUV = (fragPx - u.logoOrigin) / u.logoSize;
-    float margin = max(u.logoGlowRadius * 3.0, 0.04);
+    logoUV = (logoUV - 0.5) / max(beatZoom, 0.75) + 0.5;
+
+    float sigma = max(u.logoGlowRadius, 0.004);
+    float zoomBlurAmt = max(u.distortionStrength, 0.0) * (0.25 + kick * 0.9);
+    float margin = sigma * 3.0 + zoomBlurAmt * 1.5 + 0.04;
     if (logoUV.x < -margin || logoUV.x > 1.0 + margin ||
         logoUV.y < -margin || logoUV.y > 1.0 + margin) {
         return col;
     }
-    float m = sampleLogo(logoUV, logoTex, logoSamp, 0.0);
-    float mask = smoothstep(0.35, 0.55, m);
-    if (u.visualMode > 0.5) {
-        // Liquid Metal: solid black DSNK (soft dark edge, no white glow)
-        float edge = sampleLogo(logoUV, logoTex, logoSamp, 2.0);
-        col = mix(col, col * 0.85, smoothstep(0.15, 0.55, edge) * (1.0 - mask) * 0.5);
-        col = mix(col, float3(0.0), mask);
-    } else {
-        float glow = sampleLogo(logoUV, logoTex, logoSamp, 3.0) * u.logoGlowIntensity;
-        glow += sampleLogo(logoUV, logoTex, logoSamp, 4.5) * u.logoGlowIntensity * 0.45;
-        col += float3(1.05, 1.0, 1.08) * glow * (1.0 - m);
-        col = mix(col, float3(1.0), mask);
+
+    // Soft Gaussian bloom behind the sharp glyph
+    float blurred = logoGaussian(logoUV, logoTex, logoSamp, sigma);
+    float sharpRef = sampleLogoGlow(logoUV, logoTex, logoSamp, 0.0);
+    float halo = saturate(blurred - sharpRef * 0.85);
+    halo *= u.logoGlowIntensity * (0.9 + kick * 0.25);
+    col += float3(1.05, 1.0, 1.08) * halo;
+
+    // Mild radial zoom blur on kick (samples along ray from logo center)
+    float2 dir = logoUV - 0.5;
+    float m = 0.0;
+    float wsum = 0.0;
+    const int zTaps = 5;
+    for (int i = 0; i < zTaps; ++i) {
+        float f = (float(i) / float(zTaps - 1)) * 2.0 - 1.0; // -1…1
+        float w = 1.0 - abs(f);
+        w *= w;
+        float2 suv = logoUV + dir * (f * zoomBlurAmt);
+        m += sampleLogo(suv, logoTex, logoSamp, abs(f) * 0.8) * w;
+        wsum += w;
     }
+    m /= max(wsum, 1e-4);
+
+    // Extra horizontal tracking / shear on the hard glyph
+    if (logoWarpScale > 0.001) {
+        float2 px = fragPx;
+        float t = u.time;
+        float2 res = max(u.resolution, float2(1.0));
+        float ny = px.y / res.y;
+        float warp = logoWarpScale * (0.2 + kick * (1.4 + u.beatDistortionBoost * 0.15));
+        px.x += sin(ny * 28.0 + t * 1.8) * 2.8 * warp;
+        px.x += sin(ny * 70.0 + t * 6.0) * 1.4 * warp;
+        px.x += sin(ny * 120.0 + t * 14.0 + kick * 4.0) * 0.9 * warp * kick;
+        px.x += (hash21(float2(floor(px.y), floor(t * 36.0))) - 0.5) * 2.4 * warp;
+        px.x += (hash21(float2(floor(px.y * 0.5), floor(t * 12.0))) - 0.5) * 3.5 * warp * kick;
+        float2 warpedUV = (px - u.logoOrigin) / u.logoSize;
+        warpedUV = (warpedUV - 0.5) / max(beatZoom, 0.75) + 0.5;
+        float sharp = sampleLogo(warpedUV, logoTex, logoSamp, 0.0);
+        // Prefer sheared sample for solid fill; keep zoom-blur soft edges
+        m = max(m * (0.55 + kick * 0.35), sharp);
+    }
+
+    float mask = smoothstep(0.32, 0.52, m);
+    col = mix(col, float3(1.0), mask);
     return saturate(col);
 }
 
 /// Full frame at a screen UV (Y-down). Neighbors skip bloom for performance.
+/// texture2 = GIF sticker; texture3 = camera EMA. Logo is applied in the degrade pass.
 float3 renderEverything(float2 uvScreen, float2 fragPx, constant Uniforms &u,
                         texture2d<float> logoTex, sampler logoSamp,
                         texture2d<float> videoTex, sampler videoSamp,
+                        texture2d<float> gifTex, sampler gifSamp,
                         texture2d<float> camEMA, sampler camSamp,
                         bool withBloom) {
     float3 col = renderBackground(uvScreen, u, withBloom, videoTex, videoSamp, camEMA, camSamp);
-    return applyLogo(col, fragPx, u, logoTex, logoSamp);
+    // GIFs sit under chroma / degrade; logo is applied in the degrade pass.
+    return applyGifSticker(col, uvScreen, max(u.resolution, float2(1.0)), u, gifTex, gifSamp);
 }
 
 /// Chroma blur / smear (YUV horizontal accumulate) — applied on top of everything.
@@ -677,6 +638,7 @@ float3 chromaBlur(float2 fragCoord, float2 res, float time,
                   constant Uniforms &u,
                   texture2d<float> logoTex, sampler logoSamp,
                   texture2d<float> videoTex, sampler videoSamp,
+                  texture2d<float> gifTex, sampler gifSamp,
                   texture2d<float> camEMA, sampler camSamp) {
     float color_resX = 7.0;
     float chromaBias = 30.0;
@@ -689,7 +651,7 @@ float3 chromaBlur(float2 fragCoord, float2 res, float time,
 
     float2 uv = fragCoord / res;
     // fragCoord is Y-down framebuffer space matching in.position
-    float3 center = renderEverything(uv, fragCoord, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp, true);
+    float3 center = renderEverything(uv, fragCoord, u, logoTex, logoSamp, videoTex, videoSamp, gifTex, gifSamp, camEMA, camSamp, true);
     float Y = 0.299 * center.r + 0.587 * center.g + 0.114 * center.b;
 
     float2 colorData = float2(0.0);
@@ -699,7 +661,7 @@ float3 chromaBlur(float2 fragCoord, float2 res, float time,
         if (int(fragCoord.x) - i > 0) {
             float2 fragI = float2(fragCoord.x - float(i), fragCoord.y);
             float2 uvI = fragI / res;
-            float3 sampled = rgb2yuv(renderEverything(uvI, fragI, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp, false));
+            float3 sampled = rgb2yuv(renderEverything(uvI, fragI, u, logoTex, logoSamp, videoTex, videoSamp, gifTex, gifSamp, camEMA, camSamp, false));
             if (length(sampled.yz) > 0.02) {
                 colorData += sampled.yz;
                 samples += 1;
@@ -716,22 +678,19 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
                               sampler logoSamp [[sampler(0)]],
                               texture2d<float> videoTex [[texture(1)]],
                               sampler videoSamp [[sampler(1)]],
-                              texture2d<float> camEMA [[texture(2)]],
-                              sampler camSamp [[sampler(2)]]) {
+                              texture2d<float> gifTex [[texture(2)]],
+                              sampler gifSamp [[sampler(2)]],
+                              texture2d<float> camEMA [[texture(3)]],
+                              sampler camSamp [[sampler(3)]]) {
     float2 res = max(u.resolution, float2(1.0));
     float2 fragCoord = in.position.xy;
-    float3 col;
-    if (u.visualMode > 0.5) {
-        // Liquid Metal: camera under glass, no chroma smear
-        col = renderEverything(fragCoord / res, fragCoord, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp, false);
-    } else {
-        // VHS (default): video + noise + chroma blur (degradation is a second pass)
-        col = chromaBlur(fragCoord, res, u.time, u, logoTex, logoSamp, videoTex, videoSamp, camEMA, camSamp);
-    }
+    // Camera underlay + video + GIFs + chroma (degrade is a second pass)
+    float3 col = chromaBlur(fragCoord, res, u.time, u, logoTex, logoSamp, videoTex, videoSamp, gifTex, gifSamp, camEMA, camSamp);
     return float4(col, 1.0);
 }
 
-/// Invert live camera and EMA-blend into the history buffer (time blur).
+/// Camera EMA: sample every stride frame; idle frames decay history faster.
+/// liquidCam.x = alpha, .y = idle decay (EMA pass only), .w = stride flag (0/1).
 fragment float4 fragment_camera_ema(VertexOut in [[stage_in]],
                                     constant Uniforms &u [[buffer(0)]],
                                     texture2d<float> prevEMA [[texture(0)]],
@@ -740,15 +699,22 @@ fragment float4 fragment_camera_ema(VertexOut in [[stage_in]],
                                     sampler cameraSamp [[sampler(1)]]) {
     float2 uv = in.uv;
     float2 res = max(u.resolution, float2(1.0));
+    float3 prev = prevEMA.sample(prevSamp, uv).rgb;
+    float idleDecay = saturate(u.liquidCam.y);
+    float stride = u.liquidCam.w; // 1 = pull new camera sample this frame
+
+    if (stride < 0.5) {
+        return float4(prev * idleDecay, 1.0);
+    }
+
     float2 camSize = float2(cameraTex.get_width(), cameraTex.get_height());
     float2 camUV = aspectFillUV(uv, camSize, res);
-    float3 cam = cameraTex.sample(cameraSamp, camUV).rgb;
-    float3 inv = 1.0 - cam;
-    float3 prev = prevEMA.sample(prevSamp, uv).rgb;
+    float3 cam = cameraTex.sample(cameraSamp, camUV).rgb; // store non-inverted
     float a = saturate(u.liquidCam.x);
-    // Kick briefly pulls EMA toward the new frame (snappier trails on beats)
-    a = saturate(a + kickAmount(u) * 0.08);
-    return float4(mix(prev, inv, a), 1.0);
+    // Kick briefly pulls EMA toward the new frame
+    a = saturate(a + kickAmount(u) * 0.12);
+    float3 decayed = prev * idleDecay;
+    return float4(mix(decayed, cam, a), 1.0);
 }
 
 // -----------------------------------------------------------------------------
@@ -815,14 +781,13 @@ float3 softBufferD(texture2d<float> src, sampler srcSamp, float2 uv, float inten
     return saturate(col);
 }
 
-/// Second pass: read scene texture, apply 7clXDX Image degradation on top.
-/// Optional Y2K GIF sticker (texture 1) composited after glow.
+/// Second pass: read scene (bg + GIFs), apply 7clXDX degradation, then DSNK logo on top.
 fragment float4 fragment_vhs_degrade(VertexOut in [[stage_in]],
                                      constant Uniforms &u [[buffer(0)]],
                                      texture2d<float> sceneTex [[texture(0)]],
                                      sampler sceneSamp [[sampler(0)]],
-                                     texture2d<float> gifTex [[texture(1)]],
-                                     sampler gifSamp [[sampler(1)]]) {
+                                     texture2d<float> logoTex [[texture(1)]],
+                                     sampler logoSamp [[sampler(1)]]) {
     float2 res = max(u.resolution, float2(1.0));
     float2 fragCoord = in.position.xy;
     // Shadertoy Y-up for Image math
@@ -905,22 +870,9 @@ fragment float4 fragment_vhs_degrade(VertexOut in [[stage_in]],
         col += glow * glowAmt * (0.65 + 0.35 * (1.0 - saturate(col)));
     }
 
-    // Occasional Y2K GIF sticker overlay (from giphy explore/y2k pack)
-    float gifOp = u.liquidCam.w;
-    float2 gifOrigin = u.gifOverlay.xy;
-    float2 gifSize = u.gifOverlay.zw;
-    if (gifOp > 0.001 && gifSize.x > 0.001 && gifSize.y > 0.001) {
-        float2 guv = (metalUV - gifOrigin) / gifSize;
-        if (guv.x >= 0.0 && guv.x <= 1.0 && guv.y >= 0.0 && guv.y <= 1.0) {
-            // Mild VHS jitter on the sticker UVs
-            guv.x += (hash21(float2(floor(metalUV.y * res.y), floor(u.time * 20.0))) - 0.5) * 0.02 * kick;
-            float4 g = gifTex.sample(gifSamp, clamp(guv, 0.0, 1.0));
-            float a = saturate(g.a) * gifOp;
-            // Screen-ish pop so stickers read on busy VHS
-            float3 screened = 1.0 - (1.0 - col) * (1.0 - g.rgb);
-            col = mix(col, mix(g.rgb, screened, 0.45), a);
-        }
-    }
+    // DSNK on top — light base tracking, stronger kick shear (lavaTrough.w = vhsLogoBeatWarp).
+    float logoWarp = u.lavaTrough.w > 0.001 ? u.lavaTrough.w : 0.55;
+    col = applyLogo(col, fragCoord, u, logoTex, logoSamp, logoWarp);
 
     return float4(saturate(col), 1.0);
 }

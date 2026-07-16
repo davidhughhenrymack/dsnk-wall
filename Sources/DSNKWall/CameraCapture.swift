@@ -138,8 +138,12 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     private func configureSession(deviceID: String) {
+        if session.isRunning {
+            session.stopRunning()
+            isRunning = false
+        }
+
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
 
         for input in session.inputs {
             session.removeInput(input)
@@ -152,6 +156,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
               let input = try? AVCaptureDeviceInput(device: cam),
               session.canAddInput(input),
               session.canAddOutput(videoOutput) else {
+            session.commitConfiguration()
             fputs("CameraCapture: failed to open device \(deviceID)\n", stderr)
             return
         }
@@ -165,11 +170,11 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             conn.isVideoMirrored = false
         }
 
+        session.commitConfiguration()
+
         currentDeviceID = deviceID
-        if !session.isRunning {
-            session.startRunning()
-            isRunning = true
-        }
+        session.startRunning()
+        isRunning = session.isRunning
     }
 
     @objc private func devicesChanged() {

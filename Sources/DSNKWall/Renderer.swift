@@ -8,7 +8,7 @@ struct GPUUniforms {
     var time: Float
     var beatPulse: Float
     var beatLevel: Float
-    /// 0 = VHS, 1 = Liquid Metal (see VisualMode).
+    /// Unused (kept for ABI layout compatibility with Shaders.metal).
     var visualMode: Float
 
     var resolution: SIMD2<Float>
@@ -38,6 +38,7 @@ struct GPUUniforms {
     var rippleAxisTilt: Float
     var blobScale: Float
     var blobSpeed: Float
+    /// Unused padding (layout match with Metal Uniforms).
     var flowSpeed: Float
 
     var warpAmount: Float
@@ -55,15 +56,18 @@ struct GPUUniforms {
     var beatDistortionBoost: Float
     var beatBrightnessBoost: Float
 
-    // float4 in Metal (SIMD3 is 16 bytes in Swift; use SIMD4 for an exact match).
+    // float4 in Metal. .w slots used by VHS; .xyz unused padding.
+    /// .w = vhsLogoBeatWarp
     var lavaTrough: SIMD4<Float>
+    /// .w = vhsVideoOverCamera
     var lavaMid: SIMD4<Float>
+    /// .w = vhsCameraStrength
     var lavaHot: SIMD4<Float>
 
     /// .x = degrade intensity, .y = beat boost, .z = glow intensity, .w = glow radius
     var vhsDegrade: SIMD4<Float>
 
-    /// .x = camera EMA alpha, .y = lighten strength, .z = liquid sound drive, .w = gif opacity
+    /// .x = camera EMA alpha, .y = idle decay (EMA pass), .z unused, .w = gif opacity
     var liquidCam: SIMD4<Float>
 
     /// VHS GIF sticker: xy origin, zw size (UV Y-down)
@@ -88,10 +92,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var sceneTexture: MTLTexture?
     private var emaTextures: [MTLTexture?] = [nil, nil]
     private var emaIndex = 0
+    private var emaFrameCounter = 0
     private let fallbackCamTexture: MTLTexture
-
-    /// Selected visual pipeline (default VHS).
-    var visualMode: VisualMode = .vhs
 
     init?(metalView: MTKView, audioBeat: AudioBeat) {
         guard let device = metalView.device ?? MTLCreateSystemDefaultDevice() else {
@@ -281,22 +283,17 @@ final class Renderer: NSObject, MTKViewDelegate {
         let time = Float(now - startTime)
         let w = viewportSize.x
         let h = viewportSize.y
-        if visualMode == .vhs {
-            gifOverlay.update(time: now, viewport: viewportSize)
-        }
+        gifOverlay.update(time: now, viewport: viewportSize, beatPulse: audioBeat.beatPulse)
         // Logo rect in framebuffer pixels, origin = top-left (Metal Y-down).
         let side = Config.logoMaxFraction * min(w, h)
         let logoOrigin = SIMD2<Float>((w - side) * 0.5, (h - side) * 0.5)
         let logoSize = SIMD2<Float>(side, side)
 
-        let gifOpacity = visualMode == .vhs ? gifOverlay.currentOpacity : 0
-        let gifRect = visualMode == .vhs ? gifOverlay.rect : SIMD4<Float>.zero
-
         var uniforms = GPUUniforms(
             time: time,
             beatPulse: audioBeat.beatPulse,
             beatLevel: audioBeat.level,
-            visualMode: Float(visualMode.rawValue),
+            visualMode: 0,
             resolution: viewportSize,
             logoOrigin: logoOrigin,
             logoSize: logoSize,
@@ -319,22 +316,22 @@ final class Renderer: NSObject, MTKViewDelegate {
             rippleAxisTilt: Config.rippleAxisTilt,
             blobScale: Config.blobScale,
             blobSpeed: Config.blobSpeed,
-            flowSpeed: Config.flowSpeed,
-            warpAmount: Config.warpAmount,
-            specularPower: Config.specularPower,
-            specularIntensity: Config.specularIntensity,
-            fresnelStrength: Config.fresnelStrength,
-            lavaGlowStrength: Config.lavaGlowStrength,
-            distortionStrength: Config.distortionStrength,
-            distortionScale: Config.distortionScale,
+            flowSpeed: 0,
+            warpAmount: 0,
+            specularPower: 0,
+            specularIntensity: 0,
+            fresnelStrength: 0,
+            lavaGlowStrength: 0,
+            distortionStrength: Config.logoZoomBlur,
+            distortionScale: Config.logoBeatZoom,
             distortionSpeed: Config.distortionSpeed,
             logoGlowIntensity: Config.logoGlowIntensity,
             logoGlowRadius: Config.logoGlowRadius,
             beatDistortionBoost: Config.beatDistortionBoost,
             beatBrightnessBoost: Config.beatBrightnessBoost,
-            lavaTrough: SIMD4<Float>(Config.lavaTrough, 0),
-            lavaMid: SIMD4<Float>(Config.lavaMid, 0),
-            lavaHot: SIMD4<Float>(Config.lavaHot, 0),
+            lavaTrough: SIMD4<Float>(0, 0, 0, Config.vhsLogoBeatWarp),
+            lavaMid: SIMD4<Float>(0, 0, 0, Config.vhsVideoOverCamera),
+            lavaHot: SIMD4<Float>(0, 0, 0, Config.vhsCameraStrength),
             vhsDegrade: SIMD4<Float>(
                 Config.vhsDegradeIntensity,
                 Config.vhsDegradeBeatBoost,
@@ -343,26 +340,37 @@ final class Renderer: NSObject, MTKViewDelegate {
             ),
             liquidCam: SIMD4<Float>(
                 Config.cameraEMAAlpha,
-                Config.cameraLightenStrength,
-                Config.liquidSoundDrive,
-                gifOpacity
+                0,
+                0,
+                gifOverlay.currentOpacity
             ),
-            gifOverlay: gifRect
+            gifOverlay: gifOverlay.rect
         )
 
         let camLive = cameraCapture.currentTexture()
         let camEMARead: MTLTexture
-        if visualMode == .liquidMetal,
-           let prev = emaTextures[emaIndex],
+        if let prev = emaTextures[emaIndex],
            let next = emaTextures[1 - emaIndex] {
-            // Pass 0: invert camera + EMA time-blur → ping-pong
+            // Stride: pull a new camera sample every N frames; otherwise decay history.
+            let stride = (emaFrameCounter % Config.cameraEMAStride) == 0
+            emaFrameCounter &+= 1
+
+            var emaUniforms = uniforms
+            // EMA pass packs: .x alpha, .y idle decay, .w stride flag
+            emaUniforms.liquidCam = SIMD4<Float>(
+                Config.cameraEMAAlpha,
+                Config.cameraEMAIdleDecay,
+                0,
+                stride ? 1 : 0
+            )
+
             let emaPass = MTLRenderPassDescriptor()
             emaPass.colorAttachments[0].texture = next
             emaPass.colorAttachments[0].loadAction = .dontCare
             emaPass.colorAttachments[0].storeAction = .store
             if let encEMA = cmd.makeRenderCommandEncoder(descriptor: emaPass) {
                 encEMA.setRenderPipelineState(emaPipelineState)
-                encEMA.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
+                encEMA.setFragmentBytes(&emaUniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
                 encEMA.setFragmentTexture(prev, index: 0)
                 encEMA.setFragmentSamplerState(samplerState, index: 0)
                 encEMA.setFragmentTexture(camLive, index: 1)
@@ -376,49 +384,42 @@ final class Renderer: NSObject, MTKViewDelegate {
             camEMARead = fallbackCamTexture
         }
 
-        let useDegrade = visualMode == .vhs
-        if useDegrade, let scene = sceneTexture {
-            // Pass 1: VHS scene → offscreen
-            let scenePass = MTLRenderPassDescriptor()
-            scenePass.colorAttachments[0].texture = scene
-            scenePass.colorAttachments[0].loadAction = .clear
-            scenePass.colorAttachments[0].storeAction = .store
-            scenePass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
-            guard let enc1 = cmd.makeRenderCommandEncoder(descriptor: scenePass) else { return }
-            enc1.setRenderPipelineState(pipelineState)
-            enc1.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-            enc1.setFragmentTexture(logoTexture, index: 0)
-            enc1.setFragmentSamplerState(samplerState, index: 0)
-            enc1.setFragmentTexture(videoTexture.texture, index: 1)
-            enc1.setFragmentSamplerState(samplerState, index: 1)
-            enc1.setFragmentTexture(camEMARead, index: 2)
-            enc1.setFragmentSamplerState(samplerState, index: 2)
-            enc1.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc1.endEncoding()
+        guard let scene = sceneTexture else { return }
 
-            // Pass 2: Shadertoy 7clXDX degradation layer + Y2K GIF stickers → drawable
-            guard let enc2 = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
-            enc2.setRenderPipelineState(degradePipelineState)
-            enc2.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-            enc2.setFragmentTexture(scene, index: 0)
-            enc2.setFragmentSamplerState(samplerState, index: 0)
-            enc2.setFragmentTexture(gifOverlay.texture, index: 1)
-            enc2.setFragmentSamplerState(samplerState, index: 1)
-            enc2.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc2.endEncoding()
-        } else {
-            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
-            enc.setRenderPipelineState(pipelineState)
-            enc.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-            enc.setFragmentTexture(logoTexture, index: 0)
-            enc.setFragmentSamplerState(samplerState, index: 0)
-            enc.setFragmentTexture(videoTexture.texture, index: 1)
-            enc.setFragmentSamplerState(samplerState, index: 1)
-            enc.setFragmentTexture(camEMARead, index: 2)
-            enc.setFragmentSamplerState(samplerState, index: 2)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc.endEncoding()
-        }
+        // Pass 1: camera underlay + video + GIFs (no logo) → offscreen
+        var sceneUniforms = uniforms
+        sceneUniforms.logoSize = .zero
+        sceneUniforms.logoOrigin = .zero
+
+        let scenePass = MTLRenderPassDescriptor()
+        scenePass.colorAttachments[0].texture = scene
+        scenePass.colorAttachments[0].loadAction = .clear
+        scenePass.colorAttachments[0].storeAction = .store
+        scenePass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+        guard let enc1 = cmd.makeRenderCommandEncoder(descriptor: scenePass) else { return }
+        enc1.setRenderPipelineState(pipelineState)
+        enc1.setFragmentBytes(&sceneUniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
+        enc1.setFragmentTexture(logoTexture, index: 0)
+        enc1.setFragmentSamplerState(samplerState, index: 0)
+        enc1.setFragmentTexture(videoTexture.texture, index: 1)
+        enc1.setFragmentSamplerState(samplerState, index: 1)
+        enc1.setFragmentTexture(gifOverlay.texture, index: 2)
+        enc1.setFragmentSamplerState(samplerState, index: 2)
+        enc1.setFragmentTexture(camEMARead, index: 3)
+        enc1.setFragmentSamplerState(samplerState, index: 3)
+        enc1.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc1.endEncoding()
+
+        // Pass 2: VHS degrade (on top of GIFs) + sharp DSNK logo on top → drawable
+        guard let enc2 = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        enc2.setRenderPipelineState(degradePipelineState)
+        enc2.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
+        enc2.setFragmentTexture(scene, index: 0)
+        enc2.setFragmentSamplerState(samplerState, index: 0)
+        enc2.setFragmentTexture(logoTexture, index: 1)
+        enc2.setFragmentSamplerState(samplerState, index: 1)
+        enc2.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc2.endEncoding()
 
         cmd.present(drawable)
         cmd.commit()

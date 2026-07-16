@@ -1,18 +1,5 @@
 import simd
 
-/// Runtime visual pipeline (selected from the Visual menu).
-enum VisualMode: Int {
-    case vhs = 0
-    case liquidMetal = 1
-
-    var title: String {
-        switch self {
-        case .vhs: return "VHS"
-        case .liquidMetal: return "Liquid Metal"
-        }
-    }
-}
-
 /// All visual / audio tuning constants. Tweak and rebuild.
 enum Config {
 
@@ -80,49 +67,37 @@ enum Config {
     /// Speed of blob undulation.
     static let blobSpeed: Float = 0.3
 
-    // MARK: - Liquid VHS (Leon Denise) — pink / white only
+    // MARK: - Camera EMA (black→red underlay)
 
-    /// Animation speed multiplier for the liquid field.
-    static let flowSpeed: Float = 1.0
-    /// Kept for uniform layout / light zone warp (secondary).
-    static let warpAmount: Float = 0.35
-    static let specularPower: Float = 48.0
-    static let specularIntensity: Float = 0.85
-    static let fresnelStrength: Float = 0.55
-    static let lavaGlowStrength: Float = 1.4
-
-    /// Liquid Metal palette (pink → white only, no blacks). Mapped to lavaTrough / lavaMid / lavaHot.
-    static let liquidDark = SIMD3<Float>(1.0, 0.28, 0.68)        // saturated pink (field floor)
-    static let liquidPink = SIMD3<Float>(1.0, 0.42, 0.78)        // mid pink
-    static let liquidWhite = SIMD3<Float>(1.0, 0.97, 0.99)       // soft white
-
-    // Uniform aliases (Renderer still packs lavaTrough/Mid/Hot).
-    static let lavaTrough = liquidDark
-    static let lavaMid = liquidPink
-    static let lavaHot = liquidWhite
-
-    /// EMA blend toward each new inverted camera frame (higher = less trail / snappier).
-    static let cameraEMAAlpha: Float = 0.10
-    /// How strongly the inverted camera lightens the under-glass layer (0…1).
-    static let cameraLightenStrength: Float = 0.9
-    /// Extra beat / level drive for liquid motion and glass (1 = baseline).
-    static let liquidSoundDrive: Float = 2.2
+    /// EMA blend toward each new camera sample (higher = faster decay of trails).
+    static let cameraEMAAlpha: Float = 0.38
+    /// Only pull a new camera sample into the EMA every N frames.
+    static let cameraEMAStride: Int = 10
+    /// Per-frame multiply on EMA history when not striding (lower = faster decay).
+    static let cameraEMAIdleDecay: Float = 0.84
+    /// VHS: black→red camera underlay strength (0…1).
+    static let vhsCameraStrength: Float = 0.9
+    /// How much VHS video covers the camera underlay (0 = only cam, 1 = only video).
+    static let vhsVideoOverCamera: Float = 0.72
 
     // MARK: - VHS Y2K GIF overlays (from giphy.com/explore/y2k)
 
     /// Seconds between overlays (min…max random gap after one ends).
     static let gifOverlayMinGap: Float = 2.5
     static let gifOverlayMaxGap: Float = 7.5
-    /// How long a sticker stays on screen.
-    static let gifOverlayMinDuration: Float = 1.4
-    static let gifOverlayMaxDuration: Float = 3.2
+    /// Sticker lifetime: end after this many kick onsets, or max duration — whichever first.
+    static let gifOverlayBeatCount: Int = 16
+    /// Hard cap on how long a sticker stays on screen (seconds).
+    static let gifOverlayMaxDuration: Float = 10.0
     /// Fade in/out duration (seconds).
-    static let gifOverlayFade: Float = 0.18
+    static let gifOverlayFade: Float = 0.25
     /// Peak opacity of the sticker.
     static let gifOverlayOpacity: Float = 0.92
     /// Size as fraction of viewport height.
     static let gifOverlayMinScale: Float = 0.22
     static let gifOverlayMaxScale: Float = 0.42
+    /// Onset threshold for counting a beat against GIF lifetime.
+    static let gifOverlayBeatThreshold: Float = 0.32
 
     // MARK: - Global
 
@@ -137,10 +112,16 @@ enum Config {
     static let distortionStrength: Float = 0
     static let distortionScale: Float = 3.5
     static let distortionSpeed: Float = 0.6
-    /// Subtle glow intensity (additive halo).
-    static let logoGlowIntensity: Float = 0.22
-    /// Glow radius in logo UV space.
-    static let logoGlowRadius: Float = 0.04
+    /// Soft Gaussian glow strength around DSNK (additive).
+    static let logoGlowIntensity: Float = 0.55
+    /// Gaussian σ in logo UV space (mild bloom).
+    static let logoGlowRadius: Float = 0.028
+    /// Mild scale-up of DSNK on kick (0…0.2).
+    static let logoBeatZoom: Float = 0.07
+    /// Radial zoom-blur amount on kick (logo UV units).
+    static let logoZoomBlur: Float = 0.035
+    /// VHS: horizontal tracking / shear on DSNK (boosted further by kick).
+    static let vhsLogoBeatWarp: Float = 0.55
 
     // MARK: - Beat
 

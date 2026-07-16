@@ -17,8 +17,7 @@ enum FrameDump {
         width: Int = 1280,
         height: Int = 720,
         count: Int = 4,
-        hideLogo: Bool = true,
-        visualMode: VisualMode = .vhs
+        hideLogo: Bool = true
     ) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fputs("FrameDump: no Metal device\n", stderr)
@@ -95,7 +94,6 @@ enum FrameDump {
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
         let times: [Float] = (0..<count).map { Float($0) * 0.37 + 0.15 }
-        let useDegrade = visualMode == .vhs
 
         for (i, time) in times.enumerated() {
             video.copyFrame(at: Double(time))
@@ -104,62 +102,49 @@ enum FrameDump {
                 time: time,
                 width: Float(width),
                 height: Float(height),
-                hideLogo: hideLogo,
-                visualMode: visualMode
+                hideLogo: hideLogo
             )
 
             guard let cmd = queue.makeCommandBuffer() else { continue }
 
-            if useDegrade {
-                let scenePass = MTLRenderPassDescriptor()
-                scenePass.colorAttachments[0].texture = scene
-                scenePass.colorAttachments[0].loadAction = .clear
-                scenePass.colorAttachments[0].storeAction = .store
-                scenePass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
-                guard let enc1 = cmd.makeRenderCommandEncoder(descriptor: scenePass) else { continue }
-                enc1.setRenderPipelineState(pipeline)
-                enc1.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-                enc1.setFragmentTexture(logo, index: 0)
-                enc1.setFragmentSamplerState(sampler, index: 0)
-                enc1.setFragmentTexture(video.texture, index: 1)
-                enc1.setFragmentSamplerState(sampler, index: 1)
-                enc1.setFragmentTexture(camEMA, index: 2)
-                enc1.setFragmentSamplerState(sampler, index: 2)
-                enc1.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-                enc1.endEncoding()
+            // Pass 1: scene without logo (GIFs would bind on tex2; dump uses empty cam stand-in)
+            var sceneUniforms = uniforms
+            sceneUniforms.logoSize = .zero
+            sceneUniforms.logoOrigin = .zero
 
-                let rpd = MTLRenderPassDescriptor()
-                rpd.colorAttachments[0].texture = target
-                rpd.colorAttachments[0].loadAction = .clear
-                rpd.colorAttachments[0].storeAction = .store
-                rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
-                guard let enc2 = cmd.makeRenderCommandEncoder(descriptor: rpd) else { continue }
-                enc2.setRenderPipelineState(degradePipeline)
-                enc2.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-                enc2.setFragmentTexture(scene, index: 0)
-                enc2.setFragmentSamplerState(sampler, index: 0)
-                enc2.setFragmentTexture(camEMA, index: 1) // unused gif slot (transparent/black)
-                enc2.setFragmentSamplerState(sampler, index: 1)
-                enc2.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-                enc2.endEncoding()
-            } else {
-                let rpd = MTLRenderPassDescriptor()
-                rpd.colorAttachments[0].texture = target
-                rpd.colorAttachments[0].loadAction = .clear
-                rpd.colorAttachments[0].storeAction = .store
-                rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
-                guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { continue }
-                enc.setRenderPipelineState(pipeline)
-                enc.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-                enc.setFragmentTexture(logo, index: 0)
-                enc.setFragmentSamplerState(sampler, index: 0)
-                enc.setFragmentTexture(video.texture, index: 1)
-                enc.setFragmentSamplerState(sampler, index: 1)
-                enc.setFragmentTexture(camEMA, index: 2)
-                enc.setFragmentSamplerState(sampler, index: 2)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-                enc.endEncoding()
-            }
+            let scenePass = MTLRenderPassDescriptor()
+            scenePass.colorAttachments[0].texture = scene
+            scenePass.colorAttachments[0].loadAction = .clear
+            scenePass.colorAttachments[0].storeAction = .store
+            scenePass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+            guard let enc1 = cmd.makeRenderCommandEncoder(descriptor: scenePass) else { continue }
+            enc1.setRenderPipelineState(pipeline)
+            enc1.setFragmentBytes(&sceneUniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
+            enc1.setFragmentTexture(logo, index: 0)
+            enc1.setFragmentSamplerState(sampler, index: 0)
+            enc1.setFragmentTexture(video.texture, index: 1)
+            enc1.setFragmentSamplerState(sampler, index: 1)
+            enc1.setFragmentTexture(camEMA, index: 2) // unused gif stand-in
+            enc1.setFragmentSamplerState(sampler, index: 2)
+            enc1.setFragmentTexture(camEMA, index: 3)
+            enc1.setFragmentSamplerState(sampler, index: 3)
+            enc1.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc1.endEncoding()
+
+            let rpd = MTLRenderPassDescriptor()
+            rpd.colorAttachments[0].texture = target
+            rpd.colorAttachments[0].loadAction = .clear
+            rpd.colorAttachments[0].storeAction = .store
+            rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+            guard let enc2 = cmd.makeRenderCommandEncoder(descriptor: rpd) else { continue }
+            enc2.setRenderPipelineState(degradePipeline)
+            enc2.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
+            enc2.setFragmentTexture(scene, index: 0)
+            enc2.setFragmentSamplerState(sampler, index: 0)
+            enc2.setFragmentTexture(logo, index: 1)
+            enc2.setFragmentSamplerState(sampler, index: 1)
+            enc2.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc2.endEncoding()
 
             cmd.commit()
             cmd.waitUntilCompleted()
@@ -174,8 +159,7 @@ enum FrameDump {
         time: Float,
         width: Float,
         height: Float,
-        hideLogo: Bool,
-        visualMode: VisualMode
+        hideLogo: Bool
     ) -> GPUUniforms {
         let side: Float = hideLogo ? 0 : Config.logoMaxFraction * min(width, height)
         let logoOrigin = SIMD2<Float>((width - side) * 0.5, (height - side) * 0.5)
@@ -183,7 +167,7 @@ enum FrameDump {
             time: time,
             beatPulse: 0,
             beatLevel: 0,
-            visualMode: Float(visualMode.rawValue),
+            visualMode: 0,
             resolution: SIMD2<Float>(width, height),
             logoOrigin: logoOrigin,
             logoSize: SIMD2<Float>(side, side),
@@ -206,22 +190,22 @@ enum FrameDump {
             rippleAxisTilt: Config.rippleAxisTilt,
             blobScale: Config.blobScale,
             blobSpeed: Config.blobSpeed,
-            flowSpeed: Config.flowSpeed,
-            warpAmount: Config.warpAmount,
-            specularPower: Config.specularPower,
-            specularIntensity: Config.specularIntensity,
-            fresnelStrength: Config.fresnelStrength,
-            lavaGlowStrength: Config.lavaGlowStrength,
-            distortionStrength: Config.distortionStrength,
-            distortionScale: Config.distortionScale,
+            flowSpeed: 0,
+            warpAmount: 0,
+            specularPower: 0,
+            specularIntensity: 0,
+            fresnelStrength: 0,
+            lavaGlowStrength: 0,
+            distortionStrength: Config.logoZoomBlur,
+            distortionScale: Config.logoBeatZoom,
             distortionSpeed: Config.distortionSpeed,
             logoGlowIntensity: Config.logoGlowIntensity,
             logoGlowRadius: Config.logoGlowRadius,
             beatDistortionBoost: Config.beatDistortionBoost,
             beatBrightnessBoost: Config.beatBrightnessBoost,
-            lavaTrough: SIMD4<Float>(Config.lavaTrough, 0),
-            lavaMid: SIMD4<Float>(Config.lavaMid, 0),
-            lavaHot: SIMD4<Float>(Config.lavaHot, 0),
+            lavaTrough: SIMD4<Float>(0, 0, 0, Config.vhsLogoBeatWarp),
+            lavaMid: SIMD4<Float>(0, 0, 0, Config.vhsVideoOverCamera),
+            lavaHot: SIMD4<Float>(0, 0, 0, Config.vhsCameraStrength),
             vhsDegrade: SIMD4<Float>(
                 Config.vhsDegradeIntensity,
                 Config.vhsDegradeBeatBoost,
@@ -230,8 +214,8 @@ enum FrameDump {
             ),
             liquidCam: SIMD4<Float>(
                 Config.cameraEMAAlpha,
-                Config.cameraLightenStrength,
-                Config.liquidSoundDrive,
+                0,
+                0,
                 0
             ),
             gifOverlay: SIMD4<Float>.zero

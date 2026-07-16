@@ -3,6 +3,7 @@ import Foundation
 import ImageIO
 import Metal
 import QuartzCore
+
 /// Occasional animated Y2K GIF stickers for VHS mode.
 final class GifOverlay {
     struct Clip {
@@ -19,6 +20,8 @@ final class GifOverlay {
     private var hideAt: CFTimeInterval = 0
     private var activeClip: Clip?
     private var clipStart: CFTimeInterval = 0
+    private var beatsSeen = 0
+    private var prevBeatPulse: Float = 0
     private var originUV = SIMD2<Float>(0.1, 0.1)
     private var sizeUV = SIMD2<Float>(0.3, 0.3)
     private var opacity: Float = 0
@@ -52,7 +55,7 @@ final class GifOverlay {
         nextShowAt = CACurrentMediaTime() + Double.random(in: 1.5...4.0)
     }
 
-    func update(time now: CFTimeInterval, viewport: SIMD2<Float>) {
+    func update(time now: CFTimeInterval, viewport: SIMD2<Float>, beatPulse: Float) {
         guard !clips.isEmpty else {
             currentOpacity = 0
             texture = emptyTexture
@@ -61,12 +64,25 @@ final class GifOverlay {
         }
 
         if let clip = activeClip {
+            // Count kick onsets toward the 16-beat lifetime.
+            let thresh = Config.gifOverlayBeatThreshold
+            if beatPulse > thresh && prevBeatPulse <= thresh {
+                beatsSeen += 1
+                if beatsSeen >= Config.gifOverlayBeatCount {
+                    let fade = Double(Config.gifOverlayFade)
+                    hideAt = min(hideAt, now + fade)
+                }
+            }
+            prevBeatPulse = beatPulse
+
             if now >= hideAt {
                 activeClip = nil
                 opacity = 0
                 currentOpacity = 0
                 texture = emptyTexture
                 rect = .zero
+                beatsSeen = 0
+                prevBeatPulse = 0
                 nextShowAt = now + Double.random(in: Double(Config.gifOverlayMinGap)...Double(Config.gifOverlayMaxGap))
                 return
             }
@@ -89,14 +105,16 @@ final class GifOverlay {
         currentOpacity = 0
         texture = emptyTexture
         rect = .zero
+        prevBeatPulse = beatPulse
         guard now >= nextShowAt else { return }
 
-        // Start a new sticker
+        // Start a new sticker — up to 16 beats or 10s, whichever comes first.
         let clip = clips.randomElement()!
         activeClip = clip
         clipStart = now
-        let dur = Double.random(in: Double(Config.gifOverlayMinDuration)...Double(Config.gifOverlayMaxDuration))
-        hideAt = now + dur
+        hideAt = now + Double(Config.gifOverlayMaxDuration)
+        beatsSeen = 0
+        prevBeatPulse = beatPulse
 
         let scale = Float.random(in: Config.gifOverlayMinScale...Config.gifOverlayMaxScale)
         let hUV = scale

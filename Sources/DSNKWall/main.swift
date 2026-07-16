@@ -7,7 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var renderer: Renderer!
     var audioBeat: AudioBeat!
     private var isFullscreen = false
-    private var modeMenuItems: [NSMenuItem] = []
     private var cameraMenu: NSMenu?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -45,14 +44,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             fatalError("Failed to create Metal renderer")
         }
         renderer = r
-        renderer.visualMode = .vhs
         audioBeat.start()
         renderer.cameraCapture.onDevicesChanged = { [weak self] in
             self?.rebuildCameraMenu()
         }
         rebuildCameraMenu()
-        syncModeMenu()
-        updateWindowTitle()
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handleKey(event)
@@ -80,25 +76,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appMenu.addItem(withTitle: "Quit DSNK Wall", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
-
-        // Visual mode menu (dropdown)
-        let visualItem = NSMenuItem()
-        visualItem.title = "Visual"
-        let visualMenu = NSMenu(title: "Visual")
-
-        let vhsItem = NSMenuItem(title: VisualMode.vhs.title, action: #selector(selectVHSMode(_:)), keyEquivalent: "1")
-        vhsItem.target = self
-        vhsItem.tag = VisualMode.vhs.rawValue
-
-        let liquidItem = NSMenuItem(title: VisualMode.liquidMetal.title, action: #selector(selectLiquidMode(_:)), keyEquivalent: "2")
-        liquidItem.target = self
-        liquidItem.tag = VisualMode.liquidMetal.rawValue
-
-        visualMenu.addItem(vhsItem)
-        visualMenu.addItem(liquidItem)
-        visualItem.submenu = visualMenu
-        mainMenu.addItem(visualItem)
-        modeMenuItems = [vhsItem, liquidItem]
 
         // Camera menu (Continuity Camera / iPhone preferred)
         let cameraItem = NSMenuItem()
@@ -152,34 +129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildCameraMenu()
     }
 
-    @objc private func selectVHSMode(_ sender: Any?) {
-        setMode(.vhs)
-    }
-
-    @objc private func selectLiquidMode(_ sender: Any?) {
-        setMode(.liquidMetal)
-    }
-
     @objc private func toggleFullscreenAction(_ sender: Any?) {
         toggleFullscreen()
-    }
-
-    private func setMode(_ mode: VisualMode) {
-        renderer?.visualMode = mode
-        syncModeMenu()
-        updateWindowTitle()
-    }
-
-    private func syncModeMenu() {
-        let current = renderer?.visualMode ?? .vhs
-        for item in modeMenuItems {
-            item.state = (item.tag == current.rawValue) ? .on : .off
-        }
-    }
-
-    private func updateWindowTitle() {
-        let mode = renderer?.visualMode ?? .vhs
-        window?.title = "DSNK Wall — \(mode.title)"
     }
 
     // MARK: - Keys
@@ -191,12 +142,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if event.charactersIgnoringModifiers?.lowercased() == "f" {
             toggleFullscreen()
-        }
-        // 1 / 2 also switch modes (in addition to menu key equivalents)
-        if event.charactersIgnoringModifiers == "1" {
-            setMode(.vhs)
-        } else if event.charactersIgnoringModifiers == "2" {
-            setMode(.liquidMetal)
         }
     }
 
@@ -224,17 +169,12 @@ if args.contains("--dump-frames") {
         guard let i = args.firstIndex(of: "--count"), i + 1 < args.count else { return 4 }
         return Int(args[i + 1]) ?? 4
     }()
-    let mode: VisualMode = {
-        if args.contains("--liquid") || args.contains("--mode=liquid") { return .liquidMetal }
-        return .vhs
-    }()
     FrameDump.run(
         outputDir: URL(fileURLWithPath: outPath),
         width: 1280,
         height: 720,
         count: count,
-        hideLogo: !args.contains("--with-logo"),
-        visualMode: mode
+        hideLogo: !args.contains("--with-logo")
     )
     exit(0)
 }
